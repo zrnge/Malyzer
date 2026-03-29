@@ -1,0 +1,47 @@
+ollama:
+  host: http://localhost:11434
+  model: kimi-k2.5:cloud
+  timeout: 900          # seconds — increase for slow/thinking models
+  planner_timeout: 120  # timeout just for the analysis plan step
+
+flarevm:
+  strings: "strings64.exe"
+  floss: "floss.exe"
+  capa: "capa.exe"
+  die: "diec.exe"
+  yara: "yara64.exe"
+  procmon: "Procmon64.exe"
+  fakenet: "FakeNet.exe"
+  wireshark: "Wireshark.exe"
+  regshot: "Regshot-x64-Unicode.exe"
+  tshark: "tshark.exe"          # Wireshark CLI — packet capture
+  autorunsc: "autorunsc.exe"    # Sysinternals Autoruns — persistence snapshot
+  procdump: "procdump64.exe"    # Sysinternals ProcDump — memory dump
+
+analysis:
+  string_min_length: 4
+  high_entropy_threshold: 7.0
+  dynamic_timeout: 60
+  max_strings: 5000
+  decompile_max_bytes: 102400
+  max_static_iterations: 20     # max AI tool-selection loops (static)
+  max_dynamic_iterations: 10    # max AI tool-selection loops (dynamic)
+  tshark_capture_seconds: 60    # how long tshark captures network traffic
+  tshark_interface: ""          # leave blank to let tshark auto-select
+
+output:
+  dir: "./output"
+  report_format: html
+
+analyst:
+  name: "Security Analyst"
+  org: "Malware Analysis Lab"
+
+intel:
+  # MalwareBazaar (abuse.ch) — no API key required, always enabled
+  malwarebazaar: true
+
+  # VirusTotal — optional, requires a free API key
+  # Get yours at: https://www.virustotal.com/gui/sign-in
+  # Leave blank or as-is to skip VT lookups
+  virustotal_api_key: ""   # e.g. "abc123..."

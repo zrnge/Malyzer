@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "malyzer": {
+      "command": "python",
+      "args": ["main.py", "mcp-server"],
+      "env": {},
+      "description": "Malyzer v2.0 — AI-powered malware analysis framework. Agentic static + dynamic analysis pipeline: PE/ELF/Office/PDF/script analysis, entropy, packer detection, disassembly, IOC extraction, threat intel, Procmon, tshark, Autoruns, ProcDump, and AI-synthesised HTML/PDF/DOCX reports."
+    }
+  }
+}
