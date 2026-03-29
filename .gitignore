@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# Output / generated files
+output/
+*.html
+*.pdf
+*.docx
+*.db
+*.pcap
+*.dmp
+
+# YARA generated rules (auto-generated per sample)
+rules/generated/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Secrets / local overrides
+*.env
+local_config.yaml
