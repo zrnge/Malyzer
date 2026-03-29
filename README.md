@@ -97,7 +97,7 @@ Install from their official sources and ensure they are on `PATH` or configure p
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/malyzer.git
+git clone https://github.com/zrnge/malyzer.git
 cd malyzer
 python -m venv venv
 venv\Scripts\activate
