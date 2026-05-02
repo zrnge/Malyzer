@@ -1,6 +1,7 @@
 @echo off
 echo ============================================================
-echo  Malyze - Installation
+echo  Malyze - AI-Powered Malware Analysis Framework
+echo  Installation
 echo ============================================================
 echo.
 
@@ -30,13 +31,21 @@ echo.
 echo ============================================================
 echo  Installation complete!
 echo.
-echo  Usage:
+echo  Activate the environment:
 echo    venv\Scripts\activate
-echo    python main.py analyze  ^<sample.exe^> --analyst "Your Name"
-echo    python main.py identify ^<file^>
-echo    python main.py entropy  ^<file^>
-echo    python main.py strings  ^<file^>
-echo    python main.py mcp-server
+echo.
+echo  Usage:
+echo    python main.py web                              Launch Web UI (port 5000)
+echo    python main.py analyze  ^<sample.exe^>           Full static analysis
+echo    python main.py analyze  ^<sample.exe^> --dynamic Full static + dynamic analysis
+echo    python main.py analyze  ^<sample.exe^> --quick   Quick triage mode
+echo    python main.py identify ^<file^>                 File type + hashes
+echo    python main.py entropy  ^<file^>                 Entropy analysis
+echo    python main.py strings  ^<file^>                 String extraction
+echo    python main.py mcp-server                      MCP server for AI agents
+echo.
+echo  WARNING: --dynamic executes the sample.
+echo  Always run inside an isolated sandbox (FlareVM snapshot, air-gapped VM).
 echo.
 echo  MCP Server config: mcp_config.json
 echo ============================================================

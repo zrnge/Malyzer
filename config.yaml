@@ -1,47 +1,80 @@
 ollama:
-  host: http://localhost:11434
-  model: kimi-k2.5:cloud
-  timeout: 900          # seconds — increase for slow/thinking models
-  planner_timeout: 120  # timeout just for the analysis plan step
+  # Ollama host — quote URLs because YAML treats bare colons as mapping keys.
+  # If Malyze runs in a sandbox/VM and Ollama is on your host machine:
+  #   1. On the host, make Ollama listen on all interfaces:
+  #      (Windows)   $env:OLLAMA_HOST="0.0.0.0:11434"; ollama serve
+  #      (Linux/Mac) OLLAMA_HOST=0.0.0.0:11434 ollama serve
+  #   2. Set the host below to your host machine's LAN IP, e.g.:
+  #      host: "http://192.168.1.10:11434"
+  #   Or override at runtime:  $env:OLLAMA_HOST="http://192.168.1.10:11434"
+  host: "http://localhost:11434"
+
+  # Any model you have pulled locally:
+  #   ollama pull mistral
+  #   ollama pull llama3.1
+  #   ollama pull gemma2
+  #   ollama pull deepseek-r1
+  model: "mistral"
+
+  timeout: 900          # seconds — increase for slow/large models
+  planner_timeout: 120  # timeout for the tool-selection step only
+  api_key: ""           # leave blank for local Ollama (no key needed)
+                        # or set env var OLLAMA_API_KEY
 
 flarevm:
-  strings: "strings64.exe"
-  floss: "floss.exe"
-  capa: "capa.exe"
-  die: "diec.exe"
-  yara: "yara64.exe"
-  procmon: "Procmon64.exe"
-  fakenet: "FakeNet.exe"
+  strings:   "strings64.exe"
+  floss:     "floss.exe"
+  capa:      "capa.exe"
+  die:       "diec.exe"
+  yara:      "yara64.exe"
+  procmon:   "Procmon64.exe"
+  fakenet:   "FakeNet.exe"
   wireshark: "Wireshark.exe"
-  regshot: "Regshot-x64-Unicode.exe"
-  tshark: "tshark.exe"          # Wireshark CLI — packet capture
-  autorunsc: "autorunsc.exe"    # Sysinternals Autoruns — persistence snapshot
-  procdump: "procdump64.exe"    # Sysinternals ProcDump — memory dump
+  regshot:   "Regshot-x64-Unicode.exe"
+  tshark:    "tshark.exe"          # Wireshark CLI — packet capture
+  autorunsc: "autorunsc.exe"       # Sysinternals Autoruns — persistence snapshot
+  procdump:  "procdump64.exe"      # Sysinternals ProcDump — memory dump
+  upx:       "upx.exe"             # UPX — automatic unpacking of packed PE files
 
 analysis:
-  string_min_length: 4
+  string_min_length:      4
   high_entropy_threshold: 7.0
-  dynamic_timeout: 60
-  max_strings: 5000
-  decompile_max_bytes: 102400
-  max_static_iterations: 20     # max AI tool-selection loops (static)
-  max_dynamic_iterations: 10    # max AI tool-selection loops (dynamic)
-  tshark_capture_seconds: 60    # how long tshark captures network traffic
-  tshark_interface: ""          # leave blank to let tshark auto-select
+  dynamic_timeout:        60       # seconds the sample runs before being killed
+  max_strings:            5000
+  decompile_max_bytes:    102400
+  max_static_iterations:  20       # max AI tool-selection loops (static phase)
+  max_dynamic_iterations: 10       # max AI tool-selection loops (dynamic phase)
+  tshark_capture_seconds: 60       # how long tshark captures network traffic
+  tshark_interface:       ""       # leave blank to let tshark auto-select
 
 output:
-  dir: "./output"
-  report_format: html
+  dir:           "./output"
+  report_format: html              # html | pdf | json | all
 
 analyst:
   name: "Security Analyst"
-  org: "Malware Analysis Lab"
+  org:  "Malware Analysis Lab"
 
 intel:
-  # MalwareBazaar (abuse.ch) — no API key required, always enabled
-  malwarebazaar: true
+  # ── Free sources (no API key required) ────────────────────────────────────
+  malwarebazaar:    true   # abuse.ch hash lookup
+  circl_hashlookup: true   # CIRCL community hash DB (NSRL + malware hashes)
 
-  # VirusTotal — optional, requires a free API key
-  # Get yours at: https://www.virustotal.com/gui/sign-in
-  # Leave blank or as-is to skip VT lookups
-  virustotal_api_key: ""   # e.g. "abc123..."
+  # ── Key-gated sources (optional) ──────────────────────────────────────────
+  # VirusTotal — 60-70 AV engines; free tier = 4 req/min
+  # Get your free key at: https://www.virustotal.com/gui/sign-in
+  virustotal_api_key: ""
+
+  # Shodan — IP intelligence (open ports, hostnames, banners)
+  # Get your free key at: https://account.shodan.io
+  shodan_api_key: ""
+
+  # AlienVault OTX — threat pulse feed
+  # Get your free key at: https://otx.alienvault.com
+  otx_api_key: ""
+
+web:
+  # Optional API key — set a strong random string to protect /api/* routes.
+  # Leave blank to disable auth (safe for local use only).
+  # Example: api_key: "change-me-use-a-random-32-char-string"
+  api_key: ""

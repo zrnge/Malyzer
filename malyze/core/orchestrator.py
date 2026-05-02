@@ -37,6 +37,7 @@ Schema when running a tool:
 {
   "action": "run_tool",
   "tool_id": "<id from available list>",
+  "tool_args": "<optional argument if the tool requires one, e.g. an IP address or domain>",
   "reasoning": "<1-2 sentences referencing what you found so far>",
   "confidence": <0-100>,
   "priority": "critical|high|medium|low",
@@ -73,6 +74,7 @@ Schema when running a tool:
 {
   "action": "run_tool",
   "tool_id": "<id from available list>",
+  "tool_args": "<optional argument if the tool requires one, e.g. an IP address or domain>",
   "reasoning": "<why this tool, referencing static findings or prior dynamic results>",
   "confidence": <0-100>,
   "priority": "critical|high|medium|low",
@@ -163,6 +165,23 @@ def _summarize_result(tool_id: str, output) -> str:
                     f"Namespaces: {', '.join(ns)} | "
                     f"ATT&CK: {', '.join(atk)}")
 
+        if tool_id == "speakeasy":
+            return (f"Emulated: {output.get('architecture', '?')} | "
+                    f"API calls: {output.get('api_calls_count', 0)} | "
+                    f"Network: {len(output.get('network_events', []))} | "
+                    f"Dropped files: {len(output.get('dropped_files', []))}")
+
+        if tool_id == "shodan":
+            return (f"Shodan IP: {output.get('ip')} | "
+                    f"OS: {output.get('os')} | "
+                    f"Ports: {output.get('ports', [])} | "
+                    f"Domains: {output.get('domains', [])}")
+
+        if tool_id == "otx":
+            return (f"OTX Indicator: {output.get('indicator')} | "
+                    f"Found: {output.get('found')} | "
+                    f"Pulses: {output.get('pulse_count', 0)}")
+
         if tool_id in ("yara_python", "yara_cli"):
             matches = output.get("matches", [])
             names   = [m.get("rule","?") for m in matches[:5]]
@@ -246,9 +265,17 @@ def _summarize_dynamic_result(tool_id: str, output: dict) -> str:
             return f"Dump: {output.get('dump_path','?')} | Success: {output.get('success',False)}"
 
         if tool_id == "sample_execution":
+            if output.get("error"):
+                return f"Execution FAILED: {output['error']}"
             return (f"PID: {output.get('pid','?')} | "
                     f"Exit: {output.get('exit_code','?')} | "
+                    f"Elapsed: {output.get('elapsed_s','?')}s | "
                     f"Timed out: {output.get('timed_out',False)}")
+
+        if tool_id == "query_dynamic_events":
+            if output.get("error"):
+                return f"Query error: {output['error']}"
+            return f"Query '{output.get('query')}': {output.get('count', 0)} events found."
 
         return str(output)[:200]
     except Exception:
@@ -284,6 +311,16 @@ def _extract_key_findings(tool_id: str, output: dict) -> dict:
                     if isinstance(a, dict)
                 })[:8],
             }
+        if tool_id == "speakeasy":
+            return {
+                "api_calls_count": output.get("api_calls_count", 0),
+                "network_events_count": len(output.get("network_events", [])),
+                "dropped_files_count": len(output.get("dropped_files", [])),
+            }
+        if tool_id == "shodan":
+            return {"ip": output.get("ip"), "ports": output.get("ports", [])}
+        if tool_id == "otx":
+            return {"indicator": output.get("indicator"), "pulse_count": output.get("pulse_count", 0)}
         if tool_id in ("yara_python", "yara_cli"):
             return {"match_count": len(output.get("matches", [])),
                     "rules":       [m.get("rule","") for m in output.get("matches",[])[:5]]}
@@ -320,15 +357,20 @@ def _build_context_prompt(ctx: AnalysisContext, remaining_tools: list) -> str:
 
     # Threat intel
     intel = ctx.intel_summary
-    if intel.get("known_malware"):
-        parts += [
-            "## Threat Intelligence — KNOWN MALWARE",
-            f"- Family:       {intel.get('consensus_family', 'unknown')}",
-            f"- All families: {', '.join(intel.get('all_families', []))}",
-        ]
-        if intel.get("vt_detections"):
-            parts.append(f"- VirusTotal:   {intel['vt_detections']}")
-        parts.append("")
+    if isinstance(intel, dict):
+        if intel.get("known_malware"):
+            parts += [
+                "## Threat Intelligence — KNOWN MALWARE",
+                f"- Family:       {intel.get('consensus_family', 'unknown')}",
+                f"- All families: {', '.join(intel.get('all_families', []))}",
+            ]
+            if intel.get("vt_detections"):
+                parts.append(f"- VirusTotal:   {intel['vt_detections']}")
+            parts.append("")
+        else:
+            parts += ["## Threat Intelligence", "- Not found in threat databases", ""]
+    elif intel:
+        parts += ["## Threat Intelligence", intel, ""]
     else:
         parts += ["## Threat Intelligence", "- Not found in threat databases", ""]
 
@@ -416,12 +458,14 @@ class AgenticOrchestrator:
     The AI picks ONE tool per iteration and explains its reasoning.
     """
 
-    def __init__(self, cfg: dict, env_scan: dict, log_fn: Callable):
-        self.cfg      = cfg
-        self.env_scan = env_scan
-        self.log      = log_fn
-        self.ollama   = cfg.get("ollama", {})
-        self._max_iter = cfg.get("analysis", {}).get("max_static_iterations", MAX_STATIC_ITERATIONS)
+    def __init__(self, cfg: dict, env_scan: dict, log_fn: Callable,
+                 stop_event=None):
+        self.cfg        = cfg
+        self.env_scan   = env_scan
+        self.log        = log_fn
+        self.ollama     = cfg.get("ollama", {})
+        self._max_iter  = cfg.get("analysis", {}).get("max_static_iterations", MAX_STATIC_ITERATIONS)
+        self._stop      = stop_event  # threading.Event; set by web UI to abort analysis
 
     def run(self, ctx: AnalysisContext) -> tuple:
         """
@@ -429,13 +473,17 @@ class AgenticOrchestrator:
         Returns (collected_raw_outputs, iteration_log)
         """
         from malyze.core.agent import _run_tool, _run_cli_capture, _is_argument_error, \
-            _ask_ai_for_tool_syntax, _get_fallbacks
+            _ask_ai_for_tool_syntax, _get_fallbacks, SKIPPABLE_TOOLS
 
         collected  = {}
         iter_log   = []
         ai_online  = bool(self.ollama.get("host", "").startswith("http"))
 
         for i in range(self._max_iter):
+            if self._stop and self._stop.is_set():
+                self.log("      [ORCH] Analysis stopped by user", "warning")
+                break
+
             ctx.iteration = i + 1
             remaining     = self._get_remaining_tools(ctx)
 
@@ -463,6 +511,7 @@ class AgenticOrchestrator:
                 break
 
             tool_id   = decision.get("tool_id", "").strip()
+            tool_args = decision.get("tool_args", "")
             reasoning = decision.get("reasoning", "")
             confidence = decision.get("confidence", 0)
             hyps       = decision.get("hypotheses", [])
@@ -472,16 +521,37 @@ class AgenticOrchestrator:
             if tool_id not in valid_ids:
                 self.log(f"      [ORCH] AI chose unknown/unavailable tool '{tool_id}' — using next logical tool", "warning")
                 tool_id   = remaining[0]["tool_id"]
+                tool_args = ""
                 reasoning = "AI suggested invalid tool; using next available"
 
-            self.log(f"\n      ┌─[Step {i+1}/{self._max_iter}] Tool: {tool_id}")
+            args_str = f"({tool_args})" if tool_args else ""
+            self.log(f"\n      ┌─[Step {i+1}/{self._max_iter}] Tool: {tool_id}{args_str}")
             self.log(f"      │  Reason: {reasoning[:90]}")
             if confidence:
                 self.log(f"      │  Confidence: {confidence}%")
+            if tool_id in SKIPPABLE_TOOLS:
+                self.log(f"      │  [Press N to skip this tool and move to the next]")
 
             # Run the tool
-            run_result = _run_tool(tool_id, ctx.file_path, self.env_scan, self.cfg)
-            ctx.already_run.append(tool_id)
+            run_result = _run_tool(tool_id, ctx.file_path, self.env_scan, self.cfg, tool_args=tool_args)
+            
+            # Allow multiple calls for tools with args
+            if not tool_args:
+                ctx.already_run.append(tool_id)
+
+            # ── User skipped this tool ────────────────────────────────────────
+            if run_result.get("skipped"):
+                self.log(f"      └─ [SKIPPED] {tool_id} — moving to next tool")
+                iter_log.append({
+                    "iteration":  i + 1,
+                    "tool_id":    tool_id,
+                    "reasoning":  reasoning,
+                    "confidence": confidence,
+                    "summary":    "Skipped by user",
+                    "status":     "skipped",
+                    "hypotheses": hyps,
+                })
+                continue
 
             if run_result.get("success"):
                 raw_output = run_result["output"]
@@ -505,6 +575,7 @@ class AgenticOrchestrator:
                     "confidence":  confidence,
                     "summary":     summary,
                     "status":      "ok",
+                    "hypotheses":  hyps,
                 })
                 self.log(f"      └─ Result: {summary[:100]}")
             else:
@@ -575,6 +646,10 @@ class AgenticOrchestrator:
 
     def _get_remaining_tools(self, ctx: AnalysisContext) -> list:
         """Return available static tools not yet run, filtered by file type."""
+        quick_mode    = self.cfg.get("analysis", {}).get("quick_mode", False)
+        _SLOW_TOOLS   = {"floss", "capa"}   # skipped in --quick mode
+        excluded      = set(self.cfg.get("analysis", {}).get("excluded_tools", []))
+
         result = []
         for tid, info in self.env_scan.items():
             if not info.get("available"):
@@ -582,6 +657,10 @@ class AgenticOrchestrator:
             if info.get("category") == "dynamic":
                 continue
             if tid in ctx.already_run:
+                continue
+            if quick_mode and tid in _SLOW_TOOLS:
+                continue
+            if tid in excluded:
                 continue
             # File type filter
             file_types = info.get("file_types", [])
@@ -600,8 +679,13 @@ class AgenticOrchestrator:
     def _ask_ai(self, ctx: AnalysisContext, remaining: list) -> Optional[dict]:
         """Single Ollama call to get next tool decision."""
         import requests
+        from malyze.ai.ollama_analyzer import _ollama_headers
 
-        prompt  = _build_context_prompt(ctx, remaining)
+        _MAX_PROMPT = 8000
+        prompt = _build_context_prompt(ctx, remaining)
+        if len(prompt) > _MAX_PROMPT:
+            prompt = prompt[:_MAX_PROMPT] + "\n\n[...prompt truncated to fit context window...]"
+
         payload = {
             "model":    self.ollama.get("model", "llama3.2"),
             "messages": [
@@ -609,17 +693,41 @@ class AgenticOrchestrator:
                 {"role": "user",   "content": prompt},
             ],
             "stream":  False,
-            "options": {"temperature": 0.0, "num_predict": 512},
+            "options": {"temperature": 0.0, "num_predict": 1024},
         }
         try:
             resp = requests.post(
                 f"{self.ollama['host']}/api/chat",
+                headers=_ollama_headers(self.ollama.get("api_key", "")),
                 json=payload,
-                timeout=self.ollama.get("planner_timeout", 60),
+                timeout=self.ollama.get("planner_timeout", 120),
             )
             resp.raise_for_status()
             content = resp.json().get("message", {}).get("content", "")
             return _parse_json_decision(content)
+        except requests.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.response.text[:500]
+            except Exception:
+                pass
+            self.log(f"      [ORCH] AI call failed: {exc} — {body}", "warning")
+            if exc.response.status_code == 500:
+                short_prompt = prompt[:3000] + "\n\n[...heavily truncated due to server error...]"
+                payload["messages"][1]["content"] = short_prompt
+                try:
+                    resp2 = requests.post(
+                        f"{self.ollama['host']}/api/chat",
+                        headers=_ollama_headers(self.ollama.get("api_key", "")),
+                        json=payload,
+                        timeout=self.ollama.get("planner_timeout", 120),
+                    )
+                    resp2.raise_for_status()
+                    content = resp2.json().get("message", {}).get("content", "")
+                    return _parse_json_decision(content)
+                except Exception as retry_exc:
+                    self.log(f"      [ORCH] AI retry failed: {retry_exc}", "warning")
+            return None
         except Exception as exc:
             self.log(f"      [ORCH] AI call failed: {exc}", "warning")
             return None
@@ -658,7 +766,8 @@ class DynamicOrchestrator:
     # Tools that MUST run after sample execution
     POST_EXECUTION_TOOLS = {"autorunsc_after", "regshot", "procdump"}
 
-    def __init__(self, cfg: dict, env_scan: dict, output_dir: str, log_fn: Callable):
+    def __init__(self, cfg: dict, env_scan: dict, output_dir: str, log_fn: Callable,
+                 stop_event=None):
         self.cfg        = cfg
         self.env_scan   = env_scan
         self.output_dir = Path(output_dir)
@@ -667,6 +776,7 @@ class DynamicOrchestrator:
         self.ollama     = cfg.get("ollama", {})
         self._max_iter  = cfg.get("analysis", {}).get("max_dynamic_iterations", MAX_DYNAMIC_ITERATIONS)
         self._timeout   = cfg.get("analysis", {}).get("dynamic_timeout", 60)
+        self._stop      = stop_event
 
     def run(self, ctx: AnalysisContext, sample_path: str) -> tuple:
         """
@@ -675,7 +785,7 @@ class DynamicOrchestrator:
         """
         from malyze.dynamic.behavior_monitor import BehaviorMonitor
 
-        monitor    = BehaviorMonitor(self.cfg, str(self.output_dir))
+        monitor    = BehaviorMonitor(self.cfg, str(self.output_dir), log_fn=self.log)
         collected  = {}
         iter_log   = []
         ai_online  = bool(self.ollama.get("host", "").startswith("http"))
@@ -698,9 +808,22 @@ class DynamicOrchestrator:
         self.log(f"      [DYN] Execution: {summary_exec}")
 
         # ── Phase C: AI-driven post-execution tools ───────────────────────────
+        _MAX_QUERY_CALLS   = 4   # hard cap on query_dynamic_events calls
+        _tried_pairs: set  = set()   # (tool_id, tool_args) dedup
+        _query_call_count  = 0
+        _repeat_strikes    = 0
+
         for i in range(self._max_iter):
+            if self._stop and self._stop.is_set():
+                self.log("      [DYN] Analysis stopped by user", "warning")
+                break
+
             ctx.iteration = i + 1
             remaining     = self._get_remaining_dynamic_tools(collected)
+
+            # Hide query_dynamic_events from remaining once the cap is reached
+            if _query_call_count >= _MAX_QUERY_CALLS:
+                remaining = [t for t in remaining if t["tool_id"] != "query_dynamic_events"]
 
             if not remaining:
                 break
@@ -716,16 +839,39 @@ class DynamicOrchestrator:
                 break
 
             tool_id   = decision.get("tool_id", "").strip()
+            tool_args = decision.get("tool_args", "")
             reasoning = decision.get("reasoning", "")
 
             valid_ids = {t["tool_id"] for t in remaining}
             if tool_id not in valid_ids:
                 tool_id = remaining[0]["tool_id"]
 
-            self.log(f"      [DYN {i+1}] Running: {tool_id} — {reasoning[:70]}")
+            # Repetition guard — if the AI picks the exact same (tool, args) again, skip it
+            pair = (tool_id, tool_args)
+            if pair in _tried_pairs:
+                _repeat_strikes += 1
+                self.log(f"      [DYN] Skipping repeated call: {tool_id}({tool_args})", "warning")
+                if _repeat_strikes >= 3:
+                    self.log("      [DYN] Too many repeated calls — ending dynamic loop", "warning")
+                    break
+                continue
+            _tried_pairs.add(pair)
+            _repeat_strikes = 0
 
-            result  = self._run_dynamic_tool(tool_id, sample_path, collected, monitor, spawn_pid)
-            collected[tool_id] = result
+            if tool_id == "query_dynamic_events":
+                _query_call_count += 1
+
+            args_str = f"({tool_args})" if tool_args else ""
+            self.log(f"      [DYN {i+1}] Running: {tool_id}{args_str} — {reasoning[:70]}")
+
+            result  = self._run_dynamic_tool(tool_id, sample_path, collected, monitor, spawn_pid, tool_args=tool_args)
+
+            # Allow multiple calls for tools with args
+            if not tool_args:
+                collected[tool_id] = result
+            else:
+                # Store with index so AI can see the full query history
+                collected[f"{tool_id}_{i}"] = result
 
             summary = _summarize_dynamic_result(tool_id, result)
             ctx.findings.append({
@@ -788,13 +934,37 @@ class DynamicOrchestrator:
         collected: dict,
         monitor,
         spawn_pid: Optional[int],
+        tool_args: str = "",
     ) -> dict:
         """Dispatch a single dynamic tool call."""
         if tool_id == "procmon_results":
-            pml_path = str(self.output_dir / "procmon.pml")
+            pml_path    = str(self.output_dir / "procmon.pml")
+            sample_stem = Path(sample_path).stem   # e.g. "benign_sim"
             monitor._stop_procmon()
             csv_path = monitor._export_csv(pml_path)
-            return monitor._parse_procmon_csv(csv_path)
+            result   = monitor._parse_procmon_csv(
+                csv_path,
+                sample_pid=str(spawn_pid or ""),
+                sample_name=sample_stem,
+            )
+
+            # Pre-query sample-specific events so the AI sees them immediately
+            # rather than having to guess the right search term.
+            if result.get("db_path") and sample_stem:
+                try:
+                    from malyze.dynamic.rag_db import DynamicEventsDB
+                    db = DynamicEventsDB(result["db_path"])
+                    sample_hits = db.search_events(sample_stem)
+                    result["sample_name"]   = sample_stem
+                    result["sample_events"] = sample_hits[:30]
+                    result["search_hint"]   = (
+                        f"Use query_dynamic_events('{sample_stem}') to find more events "
+                        f"for this sample, or narrow by category: "
+                        f"'{sample_stem}|file', '{sample_stem}|registry', '{sample_stem}|network'"
+                    )
+                except Exception:
+                    pass
+            return result
 
         if tool_id == "fakenet_results":
             return monitor._read_fakenet_log()
@@ -821,10 +991,35 @@ class DynamicOrchestrator:
             dump_path = str(self.output_dir / f"dump_{pid_to_dump}.dmp")
             return self._run_procdump(pid_to_dump, dump_path)
 
+        if tool_id == "query_dynamic_events":
+            tool_args   = tool_args or ""          # guard against None from AI
+            search_term = tool_args
+            category    = None
+            if "|" in tool_args:
+                search_term, category = tool_args.split("|", 1)
+            
+            db_path = collected.get("procmon_results", {}).get("db_path")
+            if not db_path:
+                return {"error": "Procmon DB not available (run procmon_results first)"}
+                
+            from malyze.dynamic.rag_db import DynamicEventsDB
+            db = DynamicEventsDB(db_path)
+            events = db.search_events(search_term, category)
+            result = {"query": tool_args, "events": events, "count": len(events)}
+            if not events:
+                result["hint"] = (
+                    "No events matched. Try broader terms: process name (e.g. 'cmd', 'powershell'), "
+                    "path fragments (e.g. 'AppData', 'Temp', 'System32'), "
+                    "operation types (e.g. 'WriteFile', 'RegSetValue', 'TCP'), "
+                    "or category shortcuts: 'network', 'file', 'registry', 'process'."
+                )
+            return result
+
         return {"error": f"No runner for dynamic tool: {tool_id}"}
 
     def _get_remaining_dynamic_tools(self, collected: dict) -> list:
         """Return dynamic tools available and not yet collected."""
+        excluded = set(self.cfg.get("analysis", {}).get("excluded_tools", []))
         # All possible post-execution dynamic analysis IDs
         all_dynamic = [
             ("procmon_results",  "Collect Procmon process/file/registry events",   "procmon"    in self.env_scan and self.env_scan["procmon"].get("available")),
@@ -836,19 +1031,33 @@ class DynamicOrchestrator:
             ("regshot",          "Registry diff: keys added/modified by the sample","regshot"    in self.env_scan and self.env_scan["regshot"].get("available")),
             ("procdump",         "Dump spawned process memory for forensic analysis","procdump"   in self.env_scan and self.env_scan["procdump"].get("available")),
         ]
-        return [
+        
+        rem = [
             {"tool_id": tid, "description": desc}
             for tid, desc, available in all_dynamic
-            if available and tid not in collected
+            if available and tid not in collected and tid not in excluded
         ]
+
+        if "procmon_results" in collected and "query_dynamic_events" not in excluded:
+            rem.append({
+                "tool_id": "query_dynamic_events",
+                "description": "Query the Procmon SQLite DB. tool_args format: 'search_term|category' (e.g. 'cmd|process' or 'AppData|file' or 'TCP|network' or 'suspicious'). Returns up to 100 matching events."
+            })
+            
+        return rem
 
     def _ask_ai_dynamic(
         self, ctx: AnalysisContext, collected: dict, remaining: list
     ) -> Optional[dict]:
         """Ask AI for next dynamic tool decision."""
         import requests
+        from malyze.ai.ollama_analyzer import _ollama_headers
 
-        prompt  = _build_dynamic_context_prompt(ctx, collected, remaining)
+        _MAX_PROMPT = 8000
+        prompt = _build_dynamic_context_prompt(ctx, collected, remaining)
+        if len(prompt) > _MAX_PROMPT:
+            prompt = prompt[:_MAX_PROMPT] + "\n\n[...prompt truncated to fit context window...]"
+
         payload = {
             "model":    self.ollama.get("model", "llama3.2"),
             "messages": [
@@ -856,17 +1065,41 @@ class DynamicOrchestrator:
                 {"role": "user",   "content": prompt},
             ],
             "stream":  False,
-            "options": {"temperature": 0.0, "num_predict": 512},
+            "options": {"temperature": 0.0, "num_predict": 1024},
         }
         try:
             resp = requests.post(
                 f"{self.ollama['host']}/api/chat",
+                headers=_ollama_headers(self.ollama.get("api_key", "")),
                 json=payload,
-                timeout=self.ollama.get("planner_timeout", 60),
+                timeout=self.ollama.get("planner_timeout", 120),
             )
             resp.raise_for_status()
             content = resp.json().get("message", {}).get("content", "")
             return _parse_json_decision(content)
+        except requests.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.response.text[:500]
+            except Exception:
+                pass
+            self.log(f"      [DYN] AI call failed: {exc} — {body}", "warning")
+            if exc.response.status_code == 500:
+                short_prompt = prompt[:3000] + "\n\n[...heavily truncated due to server error...]"
+                payload["messages"][1]["content"] = short_prompt
+                try:
+                    resp2 = requests.post(
+                        f"{self.ollama['host']}/api/chat",
+                        headers=_ollama_headers(self.ollama.get("api_key", "")),
+                        json=payload,
+                        timeout=self.ollama.get("planner_timeout", 120),
+                    )
+                    resp2.raise_for_status()
+                    content = resp2.json().get("message", {}).get("content", "")
+                    return _parse_json_decision(content)
+                except Exception as retry_exc:
+                    self.log(f"      [DYN] AI retry failed: {retry_exc}", "warning")
+            return None
         except Exception as exc:
             self.log(f"      [DYN] AI call failed: {exc}", "warning")
             return None

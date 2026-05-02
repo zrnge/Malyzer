@@ -47,6 +47,22 @@ CATALOG = {
         "file_types":  ["*"],
     },
 
+    "shodan": {
+        "name":        "Shodan IP Intel",
+        "description": "Query an IP address (found in strings or network analysis) to see its open ports, organization, and hostnames.",
+        "type":        T_BUILTIN,
+        "category":    "threat_intel",
+        "file_types":  ["*"],
+    },
+
+    "otx": {
+        "name":        "AlienVault OTX",
+        "description": "Query an indicator (hash, IP, domain) for related malware campaigns and pulses.",
+        "type":        T_BUILTIN,
+        "category":    "threat_intel",
+        "file_types":  ["*"],
+    },
+
     "entropy": {
         "name":        "Entropy Analysis",
         "description": "Shannon entropy per file / per PE section. Detects packing and encryption.",
@@ -160,6 +176,17 @@ CATALOG = {
         "file_types":  ["ELF", "ELF_KERNEL"],
     },
 
+    "speakeasy": {
+        "name":        "CPU Emulation (Speakeasy)",
+        "description": "Emulates the binary to extract dynamically resolved APIs, network events, and dropped files statically.",
+        "type":        T_PYTHON_LIB,
+        "module":      "speakeasy",
+        "install_cmd": "pip install speakeasy-emu",
+        "source":      "https://github.com/fireeye/speakeasy",
+        "category":    "static",
+        "file_types":  ["PE", "PE_DLL"],
+    },
+
     # ── CLI tools ────────────────────────────────────────────────────────────
 
     "floss": {
@@ -173,6 +200,7 @@ CATALOG = {
         "source":      "https://github.com/mandiant/flare-floss/releases",
         "category":    "static",
         "file_types":  ["PE", "PE_DLL", "PE_DRIVER", "ELF"],
+        "timeout":     300,   # FLOSS can be slow on large/complex binaries
     },
 
     "strings_cli": {
@@ -226,6 +254,7 @@ CATALOG = {
         "category":    "static",
         "file_types":  ["PE", "PE_DLL", "PE_DRIVER", "ELF"],
         "note":        "Requires capa-rules. First run downloads rules automatically.",
+        "timeout":     240,   # CAPA rule matching can take time on large binaries
     },
 
     "yara_cli": {

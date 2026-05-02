@@ -30,9 +30,10 @@ _config_path = Path(__file__).parent.parent.parent / "config.yaml"
 _cfg = load_config(str(_config_path))
 
 mcp = FastMCP(
-    "Malyze",
+    "Malyzer",
     description="AI-powered malware analysis framework for FlareVM. "
-                "Provides static analysis, dynamic analysis, AI-powered threat intelligence, and report generation.",
+                "Agentic tool-by-tool pipeline: static analysis, dynamic behavioral analysis, "
+                "threat intel, and AI-synthesised HTML/PDF/DOCX reports.",
 )
 
 

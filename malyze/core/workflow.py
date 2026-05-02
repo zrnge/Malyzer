@@ -18,28 +18,49 @@ DEFAULT_CONFIG = {
         "model":            "llama3.2",
         "timeout":          900,
         "planner_timeout":  120,
+        "api_key":          "",
     },
     "flarevm": {
-        "strings": "strings64.exe",
-        "floss":   "floss.exe",
-        "capa":    "capa.exe",
-        "die":     "diec.exe",
+        "strings":    "strings64.exe",
+        "floss":      "floss.exe",
+        "capa":       "capa.exe",
+        "die":        "diec.exe",
+        "tshark":     "tshark.exe",
+        "autorunsc":  "autorunsc.exe",
+        "procdump":   "procdump64.exe",
+        "fakenet":    "FakeNet.exe",
+        "regshot":    "Regshot-x64-Unicode.exe",
     },
     "analysis": {
-        "string_min_length":     4,
+        "string_min_length":      4,
         "high_entropy_threshold": 7.0,
-        "dynamic_timeout":       60,
-        "max_strings":           5000,
+        "dynamic_timeout":        60,
+        "max_strings":            5000,
+        "max_static_iterations":  20,    # agentic loop cap (static)
+        "max_dynamic_iterations": 10,    # agentic loop cap (dynamic)
+        "tshark_capture_seconds": 60,
+        "tshark_interface":       "",
     },
     "output": {"dir": "./output"},
     "analyst": {
         "name": "Security Analyst",
         "org":  "Malware Analysis Lab",
     },
+    "intel": {
+        "malwarebazaar":      True,
+        "circl_hashlookup":   True,
+        "virustotal_api_key": "",
+        "shodan_api_key":     "",
+        "otx_api_key":        "",
+    },
+    "web": {
+        "api_key": "",
+    },
 }
 
 
 def load_config(config_path: Optional[str] = None) -> dict:
+    import os
     if config_path and Path(config_path).exists():
         with open(config_path) as f:
             user_cfg = yaml.safe_load(f) or {}
@@ -49,8 +70,25 @@ def load_config(config_path: Optional[str] = None) -> dict:
                 cfg[key] = {**cfg[key], **val}
             else:
                 cfg[key] = val
-        return cfg
-    return dict(DEFAULT_CONFIG)
+    else:
+        cfg = dict(DEFAULT_CONFIG)
+
+    # Environment variable overrides — useful when Malyze runs in a sandbox
+    # and Ollama runs on the host machine.
+    # OLLAMA_HOST  e.g. http://192.168.1.10:11434
+    # OLLAMA_MODEL e.g. mistral
+    # OLLAMA_API_KEY
+    env_host  = os.environ.get("OLLAMA_HOST", "").strip()
+    env_model = os.environ.get("OLLAMA_MODEL", "").strip()
+    env_key   = os.environ.get("OLLAMA_API_KEY", "").strip()
+    if env_host:
+        cfg.setdefault("ollama", {})["host"] = env_host
+    if env_model:
+        cfg.setdefault("ollama", {})["model"] = env_model
+    if env_key:
+        cfg.setdefault("ollama", {})["api_key"] = env_key
+
+    return cfg
 
 
 class AnalysisWorkflow:
@@ -65,6 +103,7 @@ class AnalysisWorkflow:
         file_path: str,
         analyst_name: Optional[str] = None,
         run_dynamic: bool = False,
+        run_static: bool = True,
         output_dir: Optional[str] = None,
     ) -> dict:
         analyst = analyst_name or self.cfg.get("analyst", {}).get("name", "Analyst")
@@ -76,6 +115,7 @@ class AnalysisWorkflow:
             file_path    = file_path,
             analyst_name = analyst,
             run_dynamic  = run_dynamic,
+            run_static   = run_static,
         )
 
         # Save raw JSON

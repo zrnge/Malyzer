@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Malyzer Report — {{ file_info.name }}</title>
+  <style>
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --border:   #30363d;
+      --text:     #c9d1d9;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --red:      #f85149;
+      --orange:   #e3b341;
+      --green:    #3fb950;
+      --cyan:     #39d353;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, monospace; font-size: 14px; line-height: 1.6; }
+    a { color: var(--accent); }
+
+    /* Layout */
+    .wrapper { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+    /* Header */
+    .report-header { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 28px; margin-bottom: 24px; }
+    .report-header h1 { font-size: 22px; color: var(--accent); letter-spacing: 2px; text-transform: uppercase; margin-bottom: 8px; }
+    .header-meta { display: flex; gap: 32px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; color: var(--muted); }
+    .header-meta span b { color: var(--text); }
+
+    /* Threat badge */
+    .threat-badge { display: inline-block; padding: 10px 24px; border-radius: 6px; font-size: 20px; font-weight: bold; letter-spacing: 3px; border: 2px solid; margin-top: 16px; }
+
+    /* Sections */
+    .section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 20px; }
+    .section h2 { font-size: 15px; color: var(--accent); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+    .section h3 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin: 16px 0 8px; }
+
+    /* Tables */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 12px; border: 1px solid var(--border); text-align: left; }
+    th { background: #1c2128; color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+    tr:hover td { background: rgba(255,255,255,0.02); }
+    td.mono { font-family: monospace; }
+
+    /* Code / pre */
+    pre { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 14px; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 12px; white-space: pre-wrap; word-break: break-all; overflow-x: auto; line-height: 1.5; }
+    .ai-block { max-height: none; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .badge-red    { background: rgba(248,81,73,0.15); color: var(--red); border: 1px solid rgba(248,81,73,0.4); }
+    .badge-orange { background: rgba(227,179,65,0.15); color: var(--orange); border: 1px solid rgba(227,179,65,0.4); }
+    .badge-green  { background: rgba(63,185,80,0.15); color: var(--green); border: 1px solid rgba(63,185,80,0.4); }
+    .badge-blue   { background: rgba(88,166,255,0.15); color: var(--accent); border: 1px solid rgba(88,166,255,0.4); }
+
+    /* Hash grid */
+    .hash-grid { display: grid; grid-template-columns: 60px 1fr; gap: 4px 12px; font-family: monospace; font-size: 12px; }
+    .hash-grid .lbl { color: var(--muted); }
+
+    /* Grid 2-col */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+
+    /* IOC pills */
+    .ioc-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .ioc-pill { background: #1c2128; border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; font-family: monospace; font-size: 11px; word-break: break-all; }
+    .ioc-pill.danger { border-color: rgba(248,81,73,0.5); color: var(--red); }
+
+    /* Disasm */
+    .disasm-line { display: flex; gap: 16px; font-size: 12px; font-family: monospace; padding: 2px 0; }
+    .disasm-addr { color: #79c0ff; min-width: 120px; }
+    .disasm-mnem { color: #ff7b72; min-width: 80px; }
+    .disasm-ops  { color: #c9d1d9; }
+
+    /* Section entropy bar */
+    .entropy-bar { height: 8px; border-radius: 4px; margin-top: 4px; }
+
+    /* Footer */
+    footer { text-align: center; color: var(--muted); font-size: 12px; margin-top: 32px; padding: 16px 0; border-top: 1px solid var(--border); }
+
+    @media print {
+      body { background: white; color: black; }
+      .section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrapper">
+
+  <!-- ── HEADER ── -->
+  <div class="report-header">
+    <h1>&#x1F6E1; Malyzer — Malware Analysis Report</h1>
+    <div style="margin-top:16px">
+      <div class="threat-badge" style="color:{{ threat_color }};border-color:{{ threat_color }}">
+        THREAT LEVEL: {{ threat_level }}
+      </div>
+    </div>
+    <div class="header-meta">
+      <span><b>Analyst:</b> {{ meta.analyst }}</span>
+      <span><b>Organization:</b> {{ meta.org }}</span>
+      <span><b>Date:</b> {{ meta.timestamp }}</span>
+      <span><b>Tool:</b> {{ meta.tool }}</span>
+      <span><b>Generated:</b> {{ generated_at }}</span>
+    </div>
+  </div>
+
+  <!-- ── FILE INFO ── -->
+  <div class="section">
+    <h2>&#x1F4C4; File Information</h2>
+    <div class="grid-2">
+      <div>
+        <table>
+          <tr><th>Property</th><th>Value</th></tr>
+          <tr><td>Filename</td><td class="mono">{{ file_info.name }}</td></tr>
+          <tr><td>Type</td><td><span class="badge badge-blue">{{ file_info.type }}</span>{% if file_info.subtype %} <span class="badge badge-blue">{{ file_info.subtype }}</span>{% endif %}</td></tr>
+          <tr><td>Extension</td><td class="mono">{{ file_info.extension }}</td></tr>
+          <tr><td>Size</td><td>{{ "{:,}".format(file_info.hashes.size) }} bytes</td></tr>
+          <tr><td>Magic Bytes</td><td class="mono">{{ file_info.magic_bytes }}</td></tr>
+        </table>
+      </div>
+      <div>
+        <h3>Cryptographic Hashes</h3>
+        <div class="hash-grid">
+          <span class="lbl">MD5</span><span class="mono">{{ file_info.hashes.md5 }}</span>
+          <span class="lbl">SHA1</span><span class="mono">{{ file_info.hashes.sha1 }}</span>
+          <span class="lbl">SHA256</span><span class="mono">{{ file_info.hashes.sha256 }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── AGENTIC DECISION TRAIL ── -->
+  {% if iteration_log %}
+  <div class="section">
+    <h2>&#x1F9E0; Agentic Analysis Trail</h2>
+    <p style="color:var(--muted);font-size:12px;margin-bottom:12px">
+      The AI selected tools one at a time. Each row shows the tool chosen, the reasoning, and what was found.
+    </p>
+    <table>
+      <tr><th>#</th><th>Tool</th><th>Status</th><th>AI Reasoning</th><th>Finding Summary</th></tr>
+      {% for entry in iteration_log %}
+      <tr>
+        <td style="color:var(--muted)">{{ entry.iteration }}</td>
+        <td class="mono" style="white-space:nowrap">{{ entry.tool_id }}</td>
+        <td>
+          {% if entry.status and entry.status.startswith('ok') %}
+            <span class="badge badge-green">OK</span>
+          {% else %}
+            <span class="badge badge-red">{{ entry.status }}</span>
+          {% endif %}
+        </td>
+        <td style="font-size:12px">{{ entry.reasoning }}</td>
+        <td style="font-size:12px;color:var(--muted)">{{ entry.summary }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- ── AI ANALYSIS ── -->
+  <div class="section">
+    <h2>&#x1F916; AI-Powered Analysis ({{ ai_analysis.model }})</h2>
+    {% if ai_analysis.error %}
+      <p style="color:var(--red)">&#x26A0; {{ ai_analysis.error }}</p>
+    {% elif ai_analysis.analysis %}
+      <pre class="ai-block">{{ ai_analysis.analysis }}</pre>
+    {% else %}
+      <p style="color:var(--muted)">No AI analysis available.</p>
+    {% endif %}
+  </div>
+
+  <!-- ── ENTROPY ── -->
+  {% set entropy = static.entropy %}
+  {% if entropy %}
+  <div class="section">
+    <h2>&#x1F4CA; Entropy Analysis</h2>
+    <table>
+      <tr><th>Metric</th><th>Value</th></tr>
+      <tr>
+        <td>Overall Entropy</td>
+        <td><b>{{ entropy.overall_entropy }}</b> / 8.0 &nbsp;
+          {% if entropy.suspicious %}<span class="badge badge-red">SUSPICIOUS</span>{% else %}<span class="badge badge-green">NORMAL</span>{% endif %}
+        </td>
+      </tr>
+      <tr><td>Classification</td><td>{{ entropy.classification }}</td></tr>
+      <tr><td>High Entropy Blocks</td><td>{{ entropy.high_entropy_blocks }} / {{ entropy.total_blocks }} ({{ (entropy.high_entropy_ratio * 100)|round(1) }}%)</td></tr>
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- ── PE ANALYSIS ── -->
+  {% set pe = static.pe %}
+  {% if pe and not pe.error %}
+  <div class="section">
+    <h2>&#x1F9F1; PE File Analysis</h2>
+    <div class="grid-2">
+      <div>
+        <h3>Headers</h3>
+        <table>
+          <tr><th>Field</th><th>Value</th></tr>
+          <tr><td>Machine</td><td>{{ pe.machine }}</td></tr>
+          <tr><td>Compile Timestamp</td><td>{{ pe.timestamp }}</td></tr>
+          <tr><td>Subsystem</td><td>{{ pe.subsystem }}</td></tr>
+          <tr><td>Entry Point</td><td class="mono">{{ pe.entry_point }}</td></tr>
+          <tr><td>Image Base</td><td class="mono">{{ pe.image_base }}</td></tr>
+          <tr><td>Is DLL</td><td>{{ pe.is_dll }}</td></tr>
+          <tr><td>Is 64-bit</td><td>{{ pe.is_64bit }}</td></tr>
+          <tr><td>Has TLS Callbacks</td><td>{% if pe.has_tls %}<span class="badge badge-orange">YES</span>{% else %}No{% endif %}</td></tr>
+          <tr><td>Digital Signature</td><td>{{ pe.has_signature }}</td></tr>
+        </table>
+      </div>
+      <div>
+        {% if pe.overlay %}
+        <h3>Overlay Data</h3>
+        <table>
+          <tr><td>Offset</td><td class="mono">{{ pe.overlay.offset }}</td></tr>
+          <tr><td>Size</td><td>{{ "{:,}".format(pe.overlay.size) }} bytes</td></tr>
+          <tr><td>Entropy</td><td>{{ pe.overlay.entropy }}</td></tr>
+        </table>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Sections -->
+    <h3>Sections</h3>
+    <table>
+      <tr><th>Name</th><th>Virtual Address</th><th>V.Size</th><th>Raw Size</th><th>Entropy</th><th>Flags</th><th>Status</th></tr>
+      {% for sec in pe.sections %}
+      <tr>
+        <td class="mono">{{ sec.name }}</td>
+        <td class="mono">{{ sec.virtual_address }}</td>
+        <td>{{ "{:,}".format(sec.virtual_size) }}</td>
+        <td>{{ "{:,}".format(sec.raw_size) }}</td>
+        <td>
+          {{ sec.entropy }}
+          <div class="entropy-bar" style="width:{{ [(sec.entropy / 8 * 100)|int, 100]|min }}%;background:{% if sec.entropy >= 7 %}var(--red){% elif sec.entropy >= 6 %}var(--orange){% else %}var(--green){% endif %}"></div>
+        </td>
+        <td style="font-size:11px">{{ sec.flags|join(', ') }}</td>
+        <td>{% if sec.suspicious %}<span class="badge badge-red">HIGH ENTROPY</span>{% else %}<span class="badge badge-green">OK</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <!-- Suspicious Imports -->
+    {% if pe.suspicious_imports %}
+    <h3 style="color:var(--red)">&#x26A0; Suspicious Imports ({{ pe.suspicious_imports|length }})</h3>
+    <div class="ioc-list">
+      {% for imp in pe.suspicious_imports %}
+        <span class="ioc-pill danger">{{ imp }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- All Imports -->
+    {% if pe.imports %}
+    <h3>Import Table</h3>
+    <table>
+      <tr><th>DLL</th><th>Function Count</th><th>Functions (sample)</th></tr>
+      {% for dll, funcs in pe.imports.items() %}
+      <tr>
+        <td class="mono">{{ dll }}</td>
+        <td>{{ funcs|length }}</td>
+        <td style="font-size:11px;font-family:monospace">{{ funcs[:8]|join(', ') }}{% if funcs|length > 8 %}...{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <!-- Exports -->
+    {% if pe.exports %}
+    <h3>Exports ({{ pe.exports|length }})</h3>
+    <div class="ioc-list">
+      {% for exp in pe.exports[:50] %}
+        <span class="ioc-pill">{{ exp.name }} (ord {{ exp.ordinal }})</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ── PACKER DETECTION ── -->
+  {% set packer = static.packer %}
+  {% if packer %}
+  <div class="section">
+    <h2>&#x1F4E6; Packer / Protector Detection</h2>
+    {% if packer.detected_packers %}
+      <div style="margin-bottom:12px">
+        {% for p in packer.detected_packers %}
+          <span class="badge badge-red" style="margin:3px">{{ p }}</span>
+        {% endfor %}
+      </div>
+    {% else %}
+      <span class="badge badge-green">No known packers detected</span>
+    {% endif %}
+
+    {% set heur = packer.sources.heuristics %}
+    {% if heur and heur.findings %}
+    <h3>Heuristic Findings</h3>
+    <ul style="margin-left:20px;font-size:13px">
+      {% for f in heur.findings %}<li>{{ f }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <!-- ── STRINGS / IOCs ── -->
+  {% set strings_data = static.strings %}
+  {% if strings_data %}
+  <div class="section">
+    <h2>&#x1F50D; Strings & IOCs</h2>
+    <p style="margin-bottom:12px;color:var(--muted)">
+      Extracted <b style="color:var(--text)">{{ strings_data.total }}</b> strings via
+      <span class="badge badge-blue">{{ strings_data.source }}</span>
+    </p>
+
+    {% set iocs = strings_data.iocs %}
+    {% if iocs %}
+
+      {% if iocs.urls %}
+      <h3 style="color:var(--red)">URLs ({{ iocs.urls|length }})</h3>
+      <div class="ioc-list">{% for u in iocs.urls[:30] %}<span class="ioc-pill danger">{{ u }}</span>{% endfor %}</div>
+      {% endif %}
+
+      {% if iocs.ips %}
+      <h3 style="color:var(--red)">IP Addresses ({{ iocs.ips|length }})</h3>
+      <div class="ioc-list">{% for i in iocs.ips[:30] %}<span class="ioc-pill danger">{{ i }}</span>{% endfor %}</div>
+      {% endif %}
+
+      {% if iocs.domains %}
+      <h3 style="color:var(--orange)">Domains ({{ iocs.domains|length }})</h3>
+      <div class="ioc-list">{% for d in iocs.domains[:30] %}<span class="ioc-pill">{{ d }}</span>{% endfor %}</div>
+      {% endif %}
+
+      {% if iocs.registry %}
+      <h3>Registry Keys</h3>
+      <div class="ioc-list">{% for r in iocs.registry[:20] %}<span class="ioc-pill">{{ r }}</span>{% endfor %}</div>
+      {% endif %}
+
+      {% if iocs.api_calls %}
+      <h3 style="color:var(--orange)">Suspicious API Calls</h3>
+      <div class="ioc-list">{% for a in iocs.api_calls[:30] %}<span class="ioc-pill danger">{{ a }}</span>{% endfor %}</div>
+      {% endif %}
+
+      {% if iocs.suspicious_keywords %}
+      <h3 style="color:var(--red)">Suspicious Keywords</h3>
+      <div class="ioc-list">{% for k in iocs.suspicious_keywords %}<span class="ioc-pill danger">{{ k }}</span>{% endfor %}</div>
+      {% endif %}
+
+    {% endif %}
+
+    <h3>String Sample (first 200)</h3>
+    <pre>{% for s in strings_data.strings[:200] %}{{ s }}
+{% endfor %}</pre>
+  </div>
+  {% endif %}
+
+  <!-- ── DISASSEMBLY ── -->
+  {% set disasm = static.disassembly %}
+  {% if disasm and not disasm.error %}
+  <div class="section">
+    <h2>&#x1F4BB; Disassembly ({{ disasm.arch }})</h2>
+    <p style="color:var(--muted);margin-bottom:12px">
+      Image Base: <span class="mono">{{ disasm.image_base }}</span> &nbsp;|&nbsp;
+      Entry Point RVA: <span class="mono">{{ disasm.entry_point_rva }}</span>
+    </p>
+    {% for block_name, block in disasm.blocks.items() %}
+      {% if not block.error %}
+      <h3>{{ block_name }} @ {{ block.va }}</h3>
+      <div style="background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:14px;font-family:monospace;font-size:12px;overflow-x:auto">
+        {% for instr in block.instructions %}
+        <div class="disasm-line">
+          <span class="disasm-addr">{{ instr.address }}</span>
+          <span class="disasm-mnem">{{ instr.mnemonic }}</span>
+          <span class="disasm-ops">{{ instr.op_str }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <!-- ── DYNAMIC ANALYSIS ── -->
+  {% if dynamic %}
+  <div class="section">
+    <h2>&#x1F3C3; Dynamic Analysis</h2>
+    {% set exec = dynamic.execution %}
+    {% if exec %}
+    <h3>Execution</h3>
+    <table>
+      <tr><td>PID</td><td>{{ exec.pid }}</td></tr>
+      <tr><td>Exit Code</td><td>{{ exec.exit_code }}</td></tr>
+      <tr><td>Timed Out</td><td>{{ exec.timed_out }}</td></tr>
+    </table>
+    {% endif %}
+
+    {% set net = dynamic.network_activity %}
+    {% if net and net.available %}
+    <h3>Network Activity ({{ net.connections|length }} events)</h3>
+    <pre>{% for c in net.connections[:30] %}{{ c }}
+{% endfor %}</pre>
+    {% endif %}
+
+    {% set proc = dynamic.process_file_registry %}
+    {% if proc and proc.available %}
+    <h3>Process/File/Registry Events ({{ proc.total_events }} total)</h3>
+    {% if proc.file_events %}
+    <h4>File Events</h4>
+    <pre>{% for e in proc.file_events[:20] %}{{ e }}
+{% endfor %}</pre>
+    {% endif %}
+    {% if proc.registry_events %}
+    <h4>Registry Events</h4>
+    <pre>{% for e in proc.registry_events[:20] %}{{ e }}
+{% endfor %}</pre>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <footer>
+    Generated by <b>Malyze</b> &mdash; AI-Powered Malware Analysis Framework<br>
+    Analyst: {{ meta.analyst }} | {{ generated_at }}
+  </footer>
+
+</div>
+</body>
+</html>

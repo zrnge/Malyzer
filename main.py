@@ -58,6 +58,8 @@ def cli():
 @click.option("--config", "-c", default="./config.yaml", help="Config file path", show_default=True)
 @click.option("--model", "-m", default="", help="Ollama model override (e.g. llama3.2, mistral)")
 @click.option("--no-ai", is_flag=True, default=False, help="Skip AI analysis")
+@click.option("--quick", "-q", is_flag=True, default=False,
+              help="Quick triage mode: cap static loop to 5 iterations, skip FLOSS/CAPA")
 @click.option("--format", "-f", "fmt",
               default="all",
               type=click.Choice(["all", "html", "pdf", "docx", "json"], case_sensitive=False),
@@ -65,7 +67,7 @@ def cli():
               help="Report format: all | html | pdf | docx | json")
 @click.option("--report-only", is_flag=True, default=False,
               help="Generate report from existing JSON (skip analysis)")
-def analyze(file_path, analyst, dynamic, output, config, model, no_ai, fmt, report_only):
+def analyze(file_path, analyst, dynamic, output, config, model, no_ai, quick, fmt, report_only):
     """Analyze a malware sample — full pipeline.
 
     \b
@@ -83,6 +85,10 @@ def analyze(file_path, analyst, dynamic, output, config, model, no_ai, fmt, repo
         cfg["ollama"]["model"] = model
     if analyst:
         cfg["analyst"]["name"] = analyst
+    if quick:
+        cfg.setdefault("analysis", {})["max_static_iterations"] = 5
+        cfg["analysis"]["quick_mode"] = True
+        console.print("[yellow]Quick mode: static loop capped at 5 iterations, FLOSS/CAPA skipped.[/yellow]")
 
     from malyze.core.workflow import AnalysisWorkflow
     from malyze.report.generator import generate_report, generate_all
@@ -208,6 +214,17 @@ def entropy(file_path):
         border_style=color,
     )
     console.print(panel)
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind address")
+@click.option("--port", "-p", default=5000, show_default=True, help="TCP port")
+@click.option("--debug", is_flag=True, default=False, help="Flask debug mode")
+def web(host, port, debug):
+    """Launch the Malyzer Web UI (drag-and-drop, real-time logs, report viewer)."""
+    console.print(BANNER)
+    from malyze.web.server import run_server
+    run_server(host=host, port=port, debug=debug)
 
 
 @cli.command("mcp-server")

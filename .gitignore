@@ -16,16 +16,21 @@ venv/
 env/
 ENV/
 
-# Output / generated files
+# Analysis output (generated per-run — never commit sample data or reports)
 output/
-*.html
+
+# Generated report files at repo root (not template source files)
 *.pdf
 *.docx
 *.db
 *.pcap
 *.dmp
 
-# YARA generated rules (auto-generated per sample)
+# HTML reports at root level — but keep Jinja/HTML template source files
+*.html
+!malyze/**/templates/*.html
+
+# YARA auto-generated hunting rules (not the base rule library)
 rules/generated/
 
 # IDE / OS
@@ -36,9 +41,12 @@ rules/generated/
 .DS_Store
 Thumbs.db
 
-# Claude Code
+# Claude Code internal
 .claude/
 
-# Secrets / local overrides
+# Secrets / local config overrides (keep config.yaml with blank keys)
 *.env
 local_config.yaml
+
+# Empty scratch file
+code

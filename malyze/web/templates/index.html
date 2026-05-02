@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Malyzer — AI Malware Analysis</title>
+<style>
+:root {
+  --bg:       #0d1117;
+  --surface:  #161b22;
+  --surface2: #1c2128;
+  --surface3: #21262d;
+  --border:   #30363d;
+  --text:     #c9d1d9;
+  --muted:    #8b949e;
+  --accent:   #58a6ff;
+  --green:    #3fb950;
+  --red:      #f85149;
+  --orange:   #e3b341;
+  --yellow:   #d29922;
+  --purple:   #bc8cff;
+  --cyan:     #39c5cf;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px; line-height: 1.6; min-height: 100vh; overflow: hidden; }
+
+/* ── Topbar ── */
+.topbar {
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  padding: 0 20px;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky; top: 0; z-index: 100;
+}
+.logo { display: flex; align-items: center; gap: 10px; }
+.logo-icon { font-size: 20px; }
+.logo-text { font-size: 17px; font-weight: 700; letter-spacing: 3px; color: var(--accent); text-transform: uppercase; }
+.logo-ver { font-size: 11px; color: var(--muted); margin-left: 2px; }
+.topbar-right { display: flex; align-items: center; gap: 16px; font-size: 12px; }
+.ollama-pill {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 20px; padding: 4px 12px;
+}
+.ollama-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+.ollama-dot.online  { background: var(--green); }
+.ollama-dot.offline { background: var(--red); animation: pulse 1.5s infinite; }
+
+/* ── Layout ── */
+.layout { display: grid; grid-template-columns: 310px 1fr; height: calc(100vh - 52px); overflow: hidden; }
+
+/* ── Left panel ── */
+.left-panel {
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.panel-section { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.panel-section:last-child { border-bottom: none; margin-top: auto; }
+.section-title {
+  font-size: 10px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 1.2px;
+  color: var(--muted); margin-bottom: 10px;
+  display: flex; align-items: center; gap: 6px;
+}
+
+/* ── Drop zone ── */
+.drop-zone {
+  border: 2px dashed var(--border); border-radius: 8px;
+  padding: 20px 14px; text-align: center; cursor: pointer;
+  transition: all 0.2s; background: var(--surface2); position: relative;
+}
+.drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: rgba(88,166,255,0.05); }
+.drop-zone.has-file { border-color: var(--green); border-style: solid; background: rgba(63,185,80,0.04); }
+.dz-icon { font-size: 28px; margin-bottom: 6px; }
+.dz-text { color: var(--muted); font-size: 12px; }
+.dz-text a { color: var(--accent); cursor: pointer; text-decoration: none; }
+.dz-text a:hover { text-decoration: underline; }
+.dz-file { margin-top: 8px; }
+.dz-name { color: var(--green); font-weight: 600; font-size: 12px; word-break: break-all; }
+.dz-size { color: var(--muted); font-size: 11px; }
+.dz-change { font-size: 11px; color: var(--muted); margin-top: 4px; }
+
+/* ── Form fields ── */
+.field { margin-bottom: 9px; }
+.field:last-child { margin-bottom: 0; }
+.field label { display: block; font-size: 10px; color: var(--muted); margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.5px; }
+.field input, .field select {
+  width: 100%; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 9px; color: var(--text); font-size: 12px;
+  outline: none; transition: border-color 0.15s;
+}
+.field input:focus, .field select:focus { border-color: var(--accent); }
+.field select option { background: var(--surface2); }
+.model-row { display: flex; gap: 6px; }
+.model-row select { flex: 1; }
+.btn-icon {
+  padding: 6px 9px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; color: var(--muted); cursor: pointer; font-size: 13px;
+  transition: all 0.15s; flex-shrink: 0;
+}
+.btn-icon:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Toggles ── */
+.toggle-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 7px 9px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer; transition: border-color 0.15s; margin-bottom: 6px;
+}
+.toggle-row:last-child { margin-bottom: 0; }
+.toggle-row:hover { border-color: var(--accent); }
+.tl-info { flex: 1; }
+.tl-label { font-size: 12px; font-weight: 500; }
+.tl-desc { font-size: 10px; color: var(--muted); }
+.switch { position: relative; width: 34px; height: 18px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; inset: 0; background: var(--border); border-radius: 18px; cursor: pointer; transition: background 0.2s; }
+.slider::before { content:""; position:absolute; width:12px; height:12px; left:3px; bottom:3px; background:white; border-radius:50%; transition:transform 0.2s; }
+.switch input:checked + .slider { background: var(--accent); }
+.switch input:checked + .slider::before { transform: translateX(16px); }
+
+/* ── Analyze + action buttons ── */
+.btn-analyze {
+  width: 100%; padding: 11px; background: var(--accent);
+  color: #0d1117; border: none; border-radius: 8px;
+  font-size: 13px; font-weight: 700; letter-spacing: 1px;
+  cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.btn-analyze:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+.btn-analyze:disabled { opacity: 0.35; cursor: not-allowed; transform: none; }
+.btn-analyze.running { background: var(--orange); }
+.btn-row { display: flex; gap: 6px; }
+.btn-danger {
+  flex: 1; padding: 7px; background: transparent;
+  border: 1px solid var(--red); border-radius: 6px;
+  color: var(--red); font-size: 11px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; text-transform: uppercase;
+}
+.btn-danger:hover:not(:disabled) { background: rgba(248,81,73,0.1); }
+.btn-danger:disabled { opacity: 0.3; cursor: not-allowed; }
+.btn-warn {
+  flex: 1; padding: 7px; background: transparent;
+  border: 1px solid var(--orange); border-radius: 6px;
+  color: var(--orange); font-size: 11px; font-weight: 600;
+  cursor: pointer; transition: all 0.15s; text-transform: uppercase;
+}
+.btn-warn:hover:not(:disabled) { background: rgba(227,179,65,0.1); }
+.btn-warn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* ── Right panel ── */
+.right-panel { display: flex; flex-direction: column; overflow: hidden; }
+
+/* ── Tabs ── */
+.tabs {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; padding: 0 16px; flex-shrink: 0;
+}
+.tab {
+  padding: 13px 16px; font-size: 12px; color: var(--muted);
+  cursor: pointer; border-bottom: 2px solid transparent;
+  transition: all 0.15s; user-select: none; display: flex; align-items: center; gap: 6px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-badge {
+  display: inline-block; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 10px; font-size: 10px; padding: 0px 5px; min-width: 18px; text-align: center;
+}
+.tab.active .tab-badge { background: rgba(88,166,255,0.15); border-color: rgba(88,166,255,0.4); }
+
+/* ── Tab panes ── */
+.tab-content { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+.tab-pane { display: none; flex: 1; overflow: hidden; flex-direction: column; }
+.tab-pane.active { display: flex; }
+
+/* ── Tools tab ── */
+.tools-pane { flex: 1; overflow-y: auto; padding: 14px 16px; }
+.tools-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.tools-search {
+  flex: 1; min-width: 140px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 9px; color: var(--text); font-size: 12px; outline: none;
+  transition: border-color 0.15s;
+}
+.tools-search:focus { border-color: var(--accent); }
+.tools-actions { display: flex; gap: 5px; flex-shrink: 0; }
+.btn-sm {
+  padding: 4px 9px; font-size: 11px; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: 4px; color: var(--muted);
+  cursor: pointer; transition: all 0.15s; white-space: nowrap;
+}
+.btn-sm:hover { border-color: var(--accent); color: var(--accent); }
+.tools-stats { font-size: 11px; color: var(--muted); }
+
+.cat-header {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px;
+  color: var(--muted); margin: 14px 0 7px; padding-bottom: 5px;
+  border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px;
+}
+.cat-count { margin-left: auto; font-size: 10px; color: var(--muted); font-weight: 400; }
+.tool-grid { display: flex; flex-direction: column; gap: 3px; }
+.tool-card {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 9px 11px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 6px; cursor: pointer; transition: all 0.15s;
+}
+.tool-card:hover { border-color: rgba(88,166,255,0.5); }
+.tool-card.checked { border-color: rgba(88,166,255,0.35); background: rgba(88,166,255,0.04); }
+.tool-card.unavailable { opacity: 0.45; }
+.tool-card.hidden { display: none; }
+.tool-check { width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; margin-top: 3px; }
+.tool-body { flex: 1; min-width: 0; }
+.tool-name { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.tool-desc { font-size: 11px; color: var(--muted); margin-top: 1px; line-height: 1.4; }
+.tool-meta { font-size: 10px; color: var(--muted); margin-top: 3px; display: flex; gap: 10px; }
+.tool-install { font-size: 10px; color: var(--orange); margin-top: 2px; font-family: monospace; }
+.tool-src { font-size: 10px; color: var(--accent); margin-top: 2px; text-decoration: none; }
+.tool-src:hover { text-decoration: underline; }
+
+.badge { display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.badge-ok    { background: rgba(63,185,80,0.15);   color: var(--green);  border: 1px solid rgba(63,185,80,0.3); }
+.badge-miss  { background: rgba(248,81,73,0.12);   color: var(--red);    border: 1px solid rgba(248,81,73,0.3); }
+.badge-slow  { background: rgba(210,153,34,0.15);  color: var(--yellow); border: 1px solid rgba(210,153,34,0.3); }
+.badge-dyn   { background: rgba(188,140,255,0.12); color: var(--purple); border: 1px solid rgba(188,140,255,0.3); }
+.badge-id    { background: rgba(57,197,207,0.12);  color: var(--cyan);   border: 1px solid rgba(57,197,207,0.3); }
+
+/* ── Console tab ── */
+.console-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.console-toolbar {
+  padding: 7px 14px; background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap;
+}
+.status-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+.status-dot.running { background: var(--orange); animation: pulse 1s infinite; }
+.status-dot.done    { background: var(--green); }
+.status-dot.error   { background: var(--red); }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.status-text { color: var(--muted); font-size: 12px; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.console-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+.btn-console {
+  padding: 4px 10px; font-size: 11px; border-radius: 5px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--muted); cursor: pointer; transition: all 0.15s;
+  white-space: nowrap;
+}
+.btn-console:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.btn-console:disabled { opacity: 0.3; cursor: not-allowed; }
+.btn-skip  { border-color: var(--orange); color: var(--orange); }
+.btn-skip:hover:not(:disabled)  { background: rgba(227,179,65,0.1); border-color: var(--orange); color: var(--orange); }
+.btn-stop  { border-color: var(--red); color: var(--red); }
+.btn-stop:hover:not(:disabled)  { background: rgba(248,81,73,0.1); border-color: var(--red); color: var(--red); }
+
+.console-log {
+  flex: 1; overflow-y: auto; padding: 10px 14px;
+  font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  font-size: 11.5px; line-height: 1.75;
+}
+.log-entry { display: flex; gap: 10px; }
+.log-ts { color: #4a5568; flex-shrink: 0; font-size: 10.5px; padding-top: 1px; user-select: none; }
+.log-msg { flex: 1; white-space: pre-wrap; word-break: break-all; }
+.log-info    .log-msg { color: var(--text); }
+.log-warning .log-msg { color: var(--orange); }
+.log-error   .log-msg { color: var(--red); }
+.log-step    .log-msg { color: var(--accent); font-weight: 600; }
+.log-ok      .log-msg { color: var(--green); }
+.log-skip    .log-msg { color: var(--yellow); }
+
+/* ── Results tab ── */
+.results-pane { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.results-empty {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  color: var(--muted); gap: 10px;
+}
+.results-empty-icon { font-size: 44px; opacity: 0.3; }
+.results-toolbar {
+  padding: 9px 14px; background: var(--surface); border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex-shrink: 0;
+}
+.threat-badge {
+  display: inline-block; padding: 3px 12px; border-radius: 5px; font-size: 12px;
+  font-weight: 700; letter-spacing: 2px; border: 1.5px solid;
+}
+.btn-dl {
+  padding: 4px 11px; font-size: 11px; border-radius: 5px; border: 1px solid var(--border);
+  background: var(--surface2); color: var(--text); cursor: pointer; transition: all 0.15s;
+  text-decoration: none; display: inline-block;
+}
+.btn-dl:hover { border-color: var(--accent); color: var(--accent); }
+.report-frame { flex: 1; border: none; width: 100%; background: white; }
+
+/* ── Scrollbars ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ── No tools notice ── */
+.no-tools { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<!-- ── Topbar ── -->
+<div class="topbar">
+  <div class="logo">
+    <span class="logo-icon">🛡</span>
+    <span class="logo-text">Malyzer</span>
+    <span class="logo-ver">v2.0</span>
+  </div>
+  <div class="topbar-right">
+    <div class="ollama-pill" id="ollamaPill">
+      <div class="ollama-dot" id="ollamaDot"></div>
+      <span id="ollamaLabel" style="color:var(--muted)">Checking…</span>
+    </div>
+    <span style="color:var(--muted);font-size:11px" id="topModel"></span>
+  </div>
+</div>
+
+<div class="layout">
+
+  <!-- ═══════════════════════════ LEFT PANEL ═══════════════════════════ -->
+  <div class="left-panel">
+
+    <!-- Sample upload -->
+    <div class="panel-section">
+      <div class="section-title">📁 Sample</div>
+      <div class="drop-zone" id="dropZone" onclick="handleDropClick(event)">
+        <div class="dz-icon" id="dzIcon">📦</div>
+        <div class="dz-text" id="dzText">Drop malware sample here or <a onclick="event.stopPropagation();document.getElementById('fileInput').click()">browse</a></div>
+        <div class="dz-file" id="dzFile" style="display:none">
+          <div class="dz-name" id="dzName"></div>
+          <div class="dz-size" id="dzSize"></div>
+          <div class="dz-change">Click to change file</div>
+        </div>
+      </div>
+      <input type="file" id="fileInput" style="display:none" onchange="onFileInput(this)">
+    </div>
+
+    <!-- Configuration -->
+    <div class="panel-section">
+      <div class="section-title">⚙ Configuration</div>
+      <div class="field">
+        <label>Analyst Name</label>
+        <input type="text" id="cfgAnalyst" placeholder="Security Analyst">
+      </div>
+      <div class="field">
+        <label>Ollama Model</label>
+        <div class="model-row">
+          <select id="cfgModel">
+            <option value="">Loading models…</option>
+          </select>
+          <button class="btn-icon" onclick="loadModels()" title="Refresh models">↺</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>API Key <span style="color:var(--muted);font-weight:400;text-transform:none">(if Ollama requires auth)</span></label>
+        <input type="password" id="cfgApiKey" placeholder="sk-… or leave blank">
+      </div>
+      <div class="field">
+        <label>Report Format</label>
+        <select id="cfgFormat">
+          <option value="all">All (HTML + PDF + DOCX + JSON)</option>
+          <option value="html">HTML only</option>
+          <option value="pdf">PDF only</option>
+          <option value="docx">DOCX only</option>
+          <option value="json">JSON only</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Options -->
+    <div class="panel-section">
+      <div class="section-title">🔧 Options</div>
+      <label class="toggle-row">
+        <div class="tl-info">
+          <div class="tl-label">Static Analysis</div>
+          <div class="tl-desc">Run tool chain + AI triage (on by default)</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="togStatic" checked><span class="slider"></span></label>
+      </label>
+      <label class="toggle-row">
+        <div class="tl-info">
+          <div class="tl-label">Dynamic Analysis</div>
+          <div class="tl-desc">Behavioral sandbox — isolated VM only!</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="togDynamic"><span class="slider"></span></label>
+      </label>
+      <label class="toggle-row">
+        <div class="tl-info">
+          <div class="tl-label">Quick Mode</div>
+          <div class="tl-desc">Cap to 5 iterations, skip FLOSS / CAPA</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="togQuick"><span class="slider"></span></label>
+      </label>
+      <label class="toggle-row">
+        <div class="tl-info">
+          <div class="tl-label">No AI (static data only)</div>
+          <div class="tl-desc">Skip Ollama synthesis</div>
+        </div>
+        <label class="switch"><input type="checkbox" id="togNoAI"><span class="slider"></span></label>
+      </label>
+    </div>
+
+    <!-- Actions -->
+    <div class="panel-section">
+      <button class="btn-analyze" id="btnAnalyze" disabled onclick="startAnalysis()">▶ Analyze</button>
+      <div class="btn-row">
+        <button class="btn-warn" id="btnSkip" disabled onclick="skipTool()" title="Skip the current slow tool and continue">⏭ Skip Tool</button>
+        <button class="btn-danger" id="btnStop" disabled onclick="stopAnalysis()" title="Abort the entire analysis">⏹ Stop</button>
+      </div>
+    </div>
+
+  </div><!-- /left-panel -->
+
+  <!-- ═══════════════════════════ RIGHT PANEL ═══════════════════════════ -->
+  <div class="right-panel">
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <div class="tab active" id="tab-tools" onclick="switchTab('tools')">🔧 Tools <span class="tab-badge" id="badgeTools">0</span></div>
+      <div class="tab" id="tab-console" onclick="switchTab('console')">📟 Console <span class="tab-badge" id="badgeLogs">0</span></div>
+      <div class="tab" id="tab-results" onclick="switchTab('results')">📊 Results</div>
+    </div>
+
+    <div class="tab-content">
+
+      <!-- ── TOOLS TAB ── -->
+      <div class="tab-pane active" id="pane-tools">
+        <div class="tools-pane">
+          <div class="tools-header">
+            <input class="tools-search" id="toolSearch" placeholder="🔍  Search tools…" oninput="filterTools()">
+            <div class="tools-actions">
+              <button class="btn-sm" onclick="selectAll(true)">All</button>
+              <button class="btn-sm" onclick="selectAll(false)">None</button>
+              <button class="btn-sm" onclick="selectAvailable()">Available</button>
+              <button class="btn-sm" onclick="selectStatic()">Static only</button>
+            </div>
+          </div>
+          <div class="tools-stats" id="toolsStats"></div>
+          <div id="toolsContainer"><div class="no-tools">Loading tools…</div></div>
+        </div>
+      </div>
+
+      <!-- ── CONSOLE TAB ── -->
+      <div class="tab-pane" id="pane-console">
+        <div class="console-pane">
+          <div class="console-toolbar">
+            <div class="status-indicator">
+              <div class="status-dot" id="statusDot"></div>
+              <span class="status-text" id="statusText">Idle</span>
+            </div>
+            <div class="console-actions">
+              <button class="btn-console btn-skip" id="cBtnSkip" disabled onclick="skipTool()">⏭ Skip Tool</button>
+              <button class="btn-console btn-stop" id="cBtnStop" disabled onclick="stopAnalysis()">⏹ Stop</button>
+              <button class="btn-console" onclick="copyLog()">📋 Copy</button>
+              <button class="btn-console" onclick="clearConsole()">✕ Clear</button>
+            </div>
+          </div>
+          <div class="console-log" id="consoleLog">
+            <div class="log-entry log-info"><span class="log-ts"></span><span class="log-msg" style="color:var(--muted)">Analysis log will appear here…</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── RESULTS TAB ── -->
+      <div class="tab-pane" id="pane-results">
+        <div class="results-pane">
+          <div class="results-empty" id="resultsEmpty">
+            <div class="results-empty-icon">🔍</div>
+            <div style="font-size:13px">No analysis complete yet</div>
+            <div style="font-size:11px">Upload a sample and click Analyze</div>
+          </div>
+          <div id="resultsReady" style="display:none;flex:1;flex-direction:column;overflow:hidden">
+            <div class="results-toolbar" id="resultsToolbar"></div>
+            <iframe class="report-frame" id="reportFrame" src="about:blank"></iframe>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /tab-content -->
+  </div><!-- /right-panel -->
+</div><!-- /layout -->
+
+<script>
+// ─── State ───────────────────────────────────────────────────────────────────
+let currentFile  = null;
+let currentJobId = null;
+let allTools     = [];
+let toolChecked  = {};
+let sseSource    = null;
+let logCount     = 0;
+let isRunning    = false;
+
+// ─── Boot ────────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", () => {
+  loadTools();
+  loadModels();
+  checkOllama();
+  initDrop();
+  document.getElementById("fileInput").addEventListener("change", e => {
+    if (e.target.files[0]) setFile(e.target.files[0]);
+  });
+});
+
+// ─── Ollama status + model list ──────────────────────────────────────────────
+async function checkOllama() {
+  const dot   = document.getElementById("ollamaDot");
+  const label = document.getElementById("ollamaLabel");
+  try {
+    const r = await fetch("/api/ollama-status");
+    const d = await r.json();
+    if (d.status === "online") {
+      dot.className   = "ollama-dot online";
+      label.style.color = "var(--green)";
+      label.textContent = "Ollama online";
+      document.getElementById("topModel").textContent = d.model || "";
+    } else {
+      dot.className   = "ollama-dot offline";
+      label.style.color = "var(--red)";
+      label.textContent = "Ollama offline";
+    }
+  } catch {
+    label.textContent = "Ollama unknown";
+  }
+}
+
+async function loadModels() {
+  const sel = document.getElementById("cfgModel");
+  sel.innerHTML = '<option value="">Loading…</option>';
+  try {
+    const r = await fetch("/api/ollama-models");
+    const d = await r.json();
+    if (d.models && d.models.length) {
+      sel.innerHTML = '<option value="">— use config default —</option>'
+        + d.models.map(m => `<option value="${m}">${m}</option>`).join("");
+    } else {
+      sel.innerHTML = '<option value="">No models found (Ollama offline?)</option>';
+    }
+  } catch {
+    sel.innerHTML = '<option value="">Error loading models</option>';
+  }
+}
+
+// ─── Tool catalog ─────────────────────────────────────────────────────────────
+async function loadTools() {
+  try {
+    const r = await fetch("/api/tools");
+    allTools = await r.json();
+  } catch { allTools = []; }
+  allTools.forEach(t => { toolChecked[t.tool_id] = t.available; });
+  renderTools();
+  updateBadge();
+}
+
+const CATEGORY_META = {
+  static:       { label: "Static Analysis",   icon: "🔬" },
+  dynamic:      { label: "Dynamic Analysis",   icon: "🧬" },
+  identification:{ label: "Identification",    icon: "🔎" },
+  network:      { label: "Network",            icon: "🌐" },
+  intel:        { label: "Threat Intel",       icon: "🕵" },
+};
+
+function renderTools() {
+  const q = (document.getElementById("toolSearch")?.value || "").toLowerCase().trim();
+  const container = document.getElementById("toolsContainer");
+
+  // Group by category
+  const groups = {};
+  allTools.forEach(t => {
+    const cat = t.category || "static";
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(t);
+  });
+
+  const catOrder = ["identification","static","dynamic","network","intel"];
+  const catKeys  = [...new Set([...catOrder, ...Object.keys(groups)])].filter(c => groups[c]);
+
+  let html = "";
+  let totalVisible = 0;
+  for (const cat of catKeys) {
+    const tools = groups[cat];
+    if (!tools) continue;
+
+    const visible = tools.filter(t =>
+      !q || t.name.toLowerCase().includes(q) || (t.description||"").toLowerCase().includes(q) || t.tool_id.includes(q)
+    );
+    if (!visible.length) continue;
+    totalVisible += visible.length;
+
+    const meta     = CATEGORY_META[cat] || { label: cat, icon: "🔩" };
+    const avail    = tools.filter(t => t.available).length;
+    const catBadge = cat === "dynamic"       ? '<span class="badge badge-dyn">dynamic</span>'
+                   : cat === "identification" ? '<span class="badge badge-id">id</span>'
+                   : "";
+
+    html += `<div class="cat-header">${meta.icon} ${meta.label} ${catBadge}
+               <span class="cat-count">${avail}/${tools.length} installed</span>
+             </div>
+             <div class="tool-grid">`;
+
+    for (const t of tools) {
+      const matchQ  = !q || t.name.toLowerCase().includes(q)
+                         || (t.description||"").toLowerCase().includes(q)
+                         || t.tool_id.includes(q);
+      const checked = toolChecked[t.tool_id];
+
+      const avBadge   = t.available ? '<span class="badge badge-ok">installed</span>' : '<span class="badge badge-miss">not found</span>';
+      const slowBadge = ["floss","capa"].includes(t.tool_id) ? '<span class="badge badge-slow">slow</span>' : "";
+      const timeoutNote = t.timeout && t.timeout >= 120 ? `<span>⏱ ${t.timeout}s timeout</span>` : "";
+      const srcLink   = t.source ? `<a class="tool-src" href="${t.source}" target="_blank" onclick="event.stopPropagation()">↗ source</a>` : "";
+      const installHint = !t.available && t.install_cmd ? `<div class="tool-install">📦 ${t.install_cmd}</div>` : "";
+      const noteHint    = t.note ? `<div class="tool-install" style="color:var(--muted)">${t.note}</div>` : "";
+
+      html += `
+        <div class="tool-card${checked?" checked":""}${!t.available?" unavailable":""}${!matchQ?" hidden":""}"
+             id="card-${t.tool_id}" onclick="toggleTool('${t.tool_id}')">
+          <input class="tool-check" type="checkbox" ${checked?"checked":""}
+                 id="chk-${t.tool_id}" onclick="event.stopPropagation();toggleTool('${t.tool_id}')">
+          <div class="tool-body">
+            <div class="tool-name">${escHtml(t.name)} ${avBadge}${slowBadge}</div>
+            <div class="tool-desc">${escHtml(t.description || "")}</div>
+            <div class="tool-meta">${timeoutNote}${srcLink}</div>
+            ${installHint}${noteHint}
+          </div>
+        </div>`;
+    }
+    html += "</div>";
+  }
+
+  if (!totalVisible) html = `<div class="no-tools">No tools match "${q}"</div>`;
+  container.innerHTML = html;
+
+  // Update stats
+  const checked = Object.values(toolChecked).filter(Boolean).length;
+  const avail   = allTools.filter(t => t.available).length;
+  document.getElementById("toolsStats").textContent =
+    `${checked} selected  ·  ${avail}/${allTools.length} installed`;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function toggleTool(id) {
+  toolChecked[id] = !toolChecked[id];
+  const chk  = document.getElementById(`chk-${id}`);
+  const card = document.getElementById(`card-${id}`);
+  if (chk)  chk.checked = toolChecked[id];
+  if (card) card.classList.toggle("checked", toolChecked[id]);
+  updateBadge();
+  updateStats();
+}
+
+function selectAll(val) {
+  allTools.forEach(t => { toolChecked[t.tool_id] = val; });
+  renderTools(); updateBadge();
+}
+function selectAvailable() {
+  allTools.forEach(t => { toolChecked[t.tool_id] = t.available; });
+  renderTools(); updateBadge();
+}
+function selectStatic() {
+  allTools.forEach(t => { toolChecked[t.tool_id] = t.available && t.category !== "dynamic"; });
+  renderTools(); updateBadge();
+}
+function filterTools() { renderTools(); updateBadge(); }
+
+function updateBadge() {
+  const n = Object.values(toolChecked).filter(Boolean).length;
+  document.getElementById("badgeTools").textContent = n;
+  updateStats();
+}
+function updateStats() {
+  const checked = Object.values(toolChecked).filter(Boolean).length;
+  const avail   = allTools.filter(t => t.available).length;
+  const el = document.getElementById("toolsStats");
+  if (el) el.textContent = `${checked} selected  ·  ${avail}/${allTools.length} installed`;
+}
+
+// ─── File drag & drop ─────────────────────────────────────────────────────────
+function initDrop() {
+  const zone = document.getElementById("dropZone");
+  zone.addEventListener("dragover",  e => { e.preventDefault(); zone.classList.add("drag-over"); });
+  zone.addEventListener("dragleave", () => zone.classList.remove("drag-over"));
+  zone.addEventListener("drop", e => {
+    e.preventDefault(); zone.classList.remove("drag-over");
+    if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  });
+}
+function handleDropClick(e) {
+  if (e.target.tagName === "A") return;
+  document.getElementById("fileInput").click();
+}
+function onFileInput(el) { if (el.files[0]) setFile(el.files[0]); }
+
+function setFile(f) {
+  currentFile = f;
+  document.getElementById("dropZone").classList.add("has-file");
+  document.getElementById("dzIcon").textContent  = "📄";
+  document.getElementById("dzText").style.display = "none";
+  document.getElementById("dzFile").style.display = "block";
+  document.getElementById("dzName").textContent  = f.name;
+  document.getElementById("dzSize").textContent  = fmtBytes(f.size);
+  document.getElementById("btnAnalyze").disabled = false;
+}
+
+function fmtBytes(b) {
+  if (b < 1024)    return b + " B";
+  if (b < 1048576) return (b/1024).toFixed(1) + " KB";
+  return (b/1048576).toFixed(1) + " MB";
+}
+
+// ─── Analysis ─────────────────────────────────────────────────────────────────
+async function startAnalysis() {
+  if (!currentFile || isRunning) return;
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  logCount = 0;
+
+  const excluded = allTools.filter(t => !toolChecked[t.tool_id]).map(t => t.tool_id);
+  const cfg = {
+    analyst:        document.getElementById("cfgAnalyst").value.trim() || "",
+    model:          document.getElementById("cfgModel").value || "",
+    api_key:        document.getElementById("cfgApiKey").value.trim() || "",
+    format:         document.getElementById("cfgFormat").value || "all",
+    static:         document.getElementById("togStatic").checked,
+    dynamic:        document.getElementById("togDynamic").checked,
+    quick:          document.getElementById("togQuick").checked,
+    no_ai:          document.getElementById("togNoAI").checked,
+    excluded_tools: excluded,
+  };
+
+  const fd = new FormData();
+  fd.append("file",   currentFile);
+  fd.append("config", JSON.stringify(cfg));
+
+  switchTab("console");
+  clearConsole();
+  setRunning(true);
+  setStatus("running", `Uploading ${currentFile.name}…`);
+
+  let data;
+  try {
+    const res = await fetch("/api/analyze", { method: "POST", body: fd });
+    data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || "Server error");
+    currentJobId = data.job_id;
+  } catch (e) {
+    setStatus("error", "Upload failed: " + e.message);
+    appendLog("ERROR: " + e.message, "error");
+    setRunning(false);
+    return;
+  }
+
+  setStatus("running", "Analysis running…");
+
+  sseSource = new EventSource(`/api/stream/${currentJobId}`);
+  sseSource.onmessage = e => {
+    const ev = JSON.parse(e.data);
+    if (ev.type === "connected") return;
+    if (ev.type === "ping") return;
+    if (ev.type === "log") {
+      appendLog(ev.msg, ev.level);
+      // Extract current tool hint from log messages
+      const m = ev.msg.match(/Running:\s*(\w+)/);
+      if (m) setStatus("running", `Running: ${m[1]}`);
+    } else if (ev.type === "done") {
+      sseSource.close(); sseSource = null;
+      setStatus("done", "Analysis complete — threat: " + ev.threat);
+      appendLog("✓ Done — threat level: " + ev.threat, "ok");
+      setRunning(false);
+      showResults(ev.threat, ev.reports);
+    } else if (ev.type === "error") {
+      sseSource.close(); sseSource = null;
+      setStatus("error", "Error: " + ev.msg);
+      appendLog("ERROR: " + ev.msg, "error");
+      setRunning(false);
+    }
+  };
+  sseSource.onerror = () => {
+    sseSource.close(); sseSource = null;
+    if (isRunning) {
+      setStatus("error", "Connection lost");
+      setRunning(false);
+    }
+  };
+}
+
+async function skipTool() {
+  if (!currentJobId || !isRunning) return;
+  appendLog("⏭ Skipping current tool…", "skip");
+  try {
+    await fetch(`/api/skip/${currentJobId}`, { method: "POST" });
+  } catch (e) {
+    appendLog("Skip failed: " + e.message, "error");
+  }
+}
+
+async function stopAnalysis() {
+  if (!currentJobId || !isRunning) return;
+  appendLog("⏹ Stopping analysis…", "warning");
+  try {
+    await fetch(`/api/stop/${currentJobId}`, { method: "POST" });
+  } catch (e) {
+    appendLog("Stop failed: " + e.message, "error");
+  }
+  setStatus("error", "Stopped by user");
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  setRunning(false);
+}
+
+function setRunning(val) {
+  isRunning = val;
+  document.getElementById("btnAnalyze").disabled = val || !currentFile;
+  document.getElementById("btnAnalyze").classList.toggle("running", val);
+  document.getElementById("btnAnalyze").textContent = val ? "⏳ Analyzing…" : "▶ Analyze";
+  document.getElementById("btnSkip").disabled  = !val;
+  document.getElementById("btnStop").disabled  = !val;
+  document.getElementById("cBtnSkip").disabled = !val;
+  document.getElementById("cBtnStop").disabled = !val;
+}
+
+// ─── Console ─────────────────────────────────────────────────────────────────
+function appendLog(msg, level) {
+  const log = document.getElementById("consoleLog");
+  const entry = document.createElement("div");
+  entry.className = `log-entry log-${level || "info"}`;
+
+  // Classify level for CSS
+  if (!level) level = "info";
+  if (level !== "error" && level !== "warning" && level !== "ok" && level !== "skip") {
+    if (/^\s*\[(\d+\/\d+)\]|^\[STEP|▶/.test(msg)) level = "step";
+    else if (/✓|OK\]|\[OK/.test(msg)) level = "ok";
+    else if (/SKIP/.test(msg)) level = "skip";
+    else level = "info";
+  }
+  entry.className = `log-entry log-${level}`;
+
+  const now = new Date();
+  const ts  = `${now.getHours().toString().padStart(2,"0")}:${now.getMinutes().toString().padStart(2,"0")}:${now.getSeconds().toString().padStart(2,"0")}`;
+  entry.innerHTML = `<span class="log-ts">${ts}</span><span class="log-msg"></span>`;
+  entry.querySelector(".log-msg").textContent = msg;
+  log.appendChild(entry);
+  log.scrollTop = log.scrollHeight;
+
+  logCount++;
+  document.getElementById("badgeLogs").textContent = logCount;
+}
+
+function clearConsole() {
+  document.getElementById("consoleLog").innerHTML =
+    '<div class="log-entry log-info"><span class="log-ts"></span><span class="log-msg" style="color:var(--muted)">Console cleared.</span></div>';
+  logCount = 0;
+  document.getElementById("badgeLogs").textContent = 0;
+}
+
+function copyLog() {
+  const lines = [...document.querySelectorAll(".log-msg")].map(el => el.textContent).join("\n");
+  navigator.clipboard.writeText(lines).catch(() => {});
+}
+
+function setStatus(state, text) {
+  document.getElementById("statusDot").className  = "status-dot " + state;
+  document.getElementById("statusText").textContent = text;
+}
+
+// ─── Results ─────────────────────────────────────────────────────────────────
+function showResults(threat, reports) {
+  switchTab("results");
+  document.getElementById("resultsEmpty").style.display  = "none";
+  const ready = document.getElementById("resultsReady");
+  ready.style.cssText = "display:flex;flex:1;flex-direction:column;overflow:hidden";
+
+  const colorMap = { CRITICAL:"#dc2626", HIGH:"#ea580c", MEDIUM:"#ca8a04", LOW:"#16a34a" };
+  const color = colorMap[threat] || "#8b949e";
+
+  let dls = "";
+  for (const [fmt, name] of Object.entries(reports||{})) {
+    if (fmt === "html") continue;
+    const icon = { pdf:"📄", docx:"📝", json:"📋" }[fmt] || "⬇";
+    dls += `<a class="btn-dl" href="/api/download/${currentJobId}/${fmt}" target="_blank">${icon} ${fmt.toUpperCase()}</a>`;
+  }
+  if (reports?.html) dls += `<a class="btn-dl" href="/api/report/${currentJobId}" target="_blank">🌐 Open Report</a>`;
+
+  document.getElementById("resultsToolbar").innerHTML = `
+    <span class="threat-badge" style="color:${color};border-color:${color}">${threat}</span>
+    <span style="font-size:11px;color:var(--muted)">${currentFile?.name || ""}</span>
+    <span style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">${dls}</span>
+  `;
+
+  if (reports?.html) {
+    document.getElementById("reportFrame").src = `/api/report/${currentJobId}`;
+  }
+}
+
+// ─── Tab switching ────────────────────────────────────────────────────────────
+function switchTab(name) {
+  ["tools","console","results"].forEach(n => {
+    document.getElementById(`tab-${n}`)?.classList.toggle("active", n === name);
+    document.getElementById(`pane-${n}`)?.classList.toggle("active", n === name);
+  });
+}
+</script>
+</body>
+</html>

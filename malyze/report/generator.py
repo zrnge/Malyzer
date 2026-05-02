@@ -150,17 +150,28 @@ def generate_report(analysis: dict, output_path: str, fmt: str = "html") -> str:
 
 def generate_all(analysis: dict, base_path: str) -> dict:
     """
-    Generate all 4 report formats from a base path (without extension).
+    Generate all report formats from a base path (without extension).
     Returns dict of {fmt: file_path}.
+    Formats: html, pdf, docx, json, stix
     """
-    base = Path(base_path)
+    base    = Path(base_path)
     results = {}
+
     for fmt in ("html", "pdf", "docx", "json"):
         out = str(base.with_suffix(f".{fmt}"))
         try:
             results[fmt] = generate_report(analysis, out, fmt=fmt)
         except Exception as e:
             results[fmt] = f"ERROR: {e}"
+
+    # STIX 2.1 bundle
+    stix_path = str(base.with_suffix(".stix.json"))
+    try:
+        from malyze.report.stix_export import write_stix_bundle
+        results["stix"] = write_stix_bundle(analysis, stix_path)
+    except Exception as e:
+        results["stix"] = f"ERROR: {e}"
+
     return results
 
 
@@ -189,14 +200,16 @@ def _write_html(analysis: dict, path: str) -> str:
         template = env.get_template("report.html")
         threat_level, threat_color, _ = _threat_level(analysis)
         ctx = {
-            "meta":         analysis.get("meta", {}),
-            "file_info":    analysis.get("file_info", {}),
-            "static":       analysis.get("static", {}),
-            "dynamic":      analysis.get("dynamic"),
-            "ai_analysis":  analysis.get("ai_analysis", {}),
-            "threat_level": threat_level,
-            "threat_color": threat_color,
-            "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "meta":          analysis.get("meta", {}),
+            "file_info":     analysis.get("file_info", {}),
+            "static":        analysis.get("static", {}),
+            "dynamic":       analysis.get("dynamic"),
+            "ai_analysis":   analysis.get("ai_analysis", {}),
+            "intel":         analysis.get("intel", {}),
+            "iteration_log": analysis.get("iteration_log", []),
+            "threat_level":  threat_level,
+            "threat_color":  threat_color,
+            "generated_at":  datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
         }
         html = template.render(**ctx)
         Path(path).write_text(html, encoding="utf-8")
@@ -458,6 +471,90 @@ footer{{text-align:center;color:#8b949e;font-size:12px;margin-top:32px;padding-t
 <pre>{sample}</pre>
 </div>""")
 
+    # Enriched IOC Intelligence
+    enriched_ioc = analysis.get("enriched_iocs", {})
+    if enriched_ioc:
+        ips_enr     = [e for e in enriched_ioc.get("ips", [])     if not e.get("error")]
+        domains_enr = [e for e in enriched_ioc.get("domains", []) if not e.get("error")]
+        urls_enr    = [e for e in enriched_ioc.get("urls", [])    if not e.get("error")]
+        if ips_enr or domains_enr or urls_enr:
+            def _flag_badge(label, style="background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.4)"):
+                return f'<span class="badge" style="{style};margin:2px">{esc(label)}</span>'
+            ip_rows = ""
+            for e in ips_enr[:20]:
+                flags = (
+                    ([_flag_badge("PROXY")] if e.get("is_proxy") else [])
+                    + ([_flag_badge("HOSTING")] if e.get("is_hosting") else [])
+                    + ([_flag_badge(f"URLhaus:{e['urlhaus_hits']}")] if e.get("urlhaus_hits") else [])
+                )
+                flag_html = " ".join(flags) or '<span style="color:#3fb950">clean</span>'
+                ip_rows += (
+                    f"<tr><td class='mono'>{esc(e.get('ip',''))}</td>"
+                    f"<td>{esc(e.get('country','?'))}/{esc(e.get('city','?'))}</td>"
+                    f"<td style='font-size:11px'>{esc(e.get('isp','?'))}</td>"
+                    f"<td>{flag_html}</td></tr>"
+                )
+            dom_rows = ""
+            for e in domains_enr[:20]:
+                flags = []
+                if e.get("urlhaus_hits"): flags.append(_flag_badge(f"URLhaus:{e['urlhaus_hits']}"))
+                if e.get("is_dga"):       flags.append(_flag_badge(f"DGA:{e['dga_score']}", "background:rgba(234,88,12,.15);color:#e3b341;border:1px solid rgba(234,88,12,.4)"))
+                if e.get("pdns_total"):   flags.append(_flag_badge(f"PDNS:{e['pdns_total']}records", "background:#1c2128;border:1px solid #30363d;color:#79c0ff"))
+                if e.get("cert_total"):   flags.append(_flag_badge(f"Certs:{e['cert_total']}", "background:#1c2128;border:1px solid #30363d;color:#79c0ff"))
+                threat_html = " ".join(flags) if flags else '<span style="color:#3fb950">clean</span>'
+                dom_rows += (
+                    f"<tr><td class='mono'>{esc(e.get('domain',''))}</td>"
+                    f"<td class='mono' style='font-size:11px'>{esc(str(e.get('resolved_ip','') or ''))}</td>"
+                    f"<td>{threat_html}</td></tr>"
+                )
+            url_rows = ""
+            for e in [u for u in urls_enr if u.get("urlhaus_hits")][:10]:
+                _ub = f"URLhaus:{e['urlhaus_hits']} ({e.get('urlhaus_status', '')})"
+                url_rows += (
+                    f"<tr><td class='mono' style='font-size:11px'>{esc(e.get('url', '')[:80])}</td>"
+                    f"<td>{_flag_badge(_ub)}</td></tr>"
+                )
+            ip_tbl = (
+                f"<h3>IP Addresses ({len(ips_enr)})</h3>"
+                f"<table><tr><th>IP</th><th>Location</th><th>ISP</th><th>Flags</th></tr>{ip_rows}</table>"
+            ) if ip_rows else ""
+            dom_tbl = (
+                f"<h3>Domains ({len(domains_enr)})</h3>"
+                f"<table><tr><th>Domain</th><th>Resolved IP</th><th>Flags</th></tr>{dom_rows}</table>"
+            ) if dom_rows else ""
+            url_tbl = (
+                f"<h3>Flagged URLs</h3>"
+                f"<table><tr><th>URL</th><th>Flags</th></tr>{url_rows}</table>"
+            ) if url_rows else ""
+            lines.append(f"""<div class="card">
+<h2>&#x1F30D; Enriched IOC Intelligence</h2>
+{ip_tbl}{dom_tbl}{url_tbl}
+</div>""")
+
+    # AI-identified TTPs (from structured output, includes source_tool + evidence)
+    ai_structured = analysis.get("ai_analysis", {}).get("structured") or {}
+    ttps = ai_structured.get("ttps", [])
+    if ttps:
+        ttp_rows = ""
+        for t in ttps[:40]:
+            tid    = esc(t.get("id", ""))
+            tname  = esc(t.get("name", ""))
+            src    = esc(t.get("source_tool", ""))
+            evid   = esc(t.get("evidence", ""))
+            ttp_rows += (
+                f"<tr><td class='mono' style='color:#f85149'>{tid}</td>"
+                f"<td>{tname}</td>"
+                f"<td><span class='badge' style='background:#1c2128;border:1px solid #30363d;color:#8b949e'>{src}</span></td>"
+                f"<td style='font-size:11px;color:#8b949e'>{evid}</td></tr>"
+            )
+        lines.append(f"""<div class="card">
+<h2>&#x1F3AF; MITRE ATT&amp;CK TTPs (AI-identified, {len(ttps)} techniques)</h2>
+<table>
+<tr><th>ID</th><th>Technique</th><th>Source Tool</th><th>Evidence</th></tr>
+{ttp_rows}
+</table>
+</div>""")
+
     # Disasm
     disasm = static.get("disassembly", {})
     if disasm and not disasm.get("error"):
@@ -480,7 +577,9 @@ footer{{text-align:center;color:#8b949e;font-size:12px;margin-top:32px;padding-t
 </div>""")
 
     lines.append(f"""<footer>Generated by <b>Malyze</b> — AI-Powered Malware Analysis Framework<br>
-Analyst: {esc(meta.get('analyst',''))} | {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</footer>
+Analyst: {esc(meta.get('analyst',''))} | {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}<br>
+<span style="font-size:11px;color:#58a6ff">&#x1F4E6; Report formats: HTML · PDF · DOCX · JSON · STIX 2.1</span>
+</footer>
 </div></body></html>""")
 
     Path(path).write_text("\n".join(lines), encoding="utf-8")

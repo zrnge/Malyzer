@@ -1,23 +1,35 @@
 """
-AI Analysis Agent — drives the entire analysis loop.
+Malyzer Agent — agentic malware analysis pipeline.
 
 Flow:
-  1. Detect environment + available tools
-  2. Identify file type
-  3. Ask AI to plan the analysis (which tools, in what order)
-  4. Execute each step — if it fails, ask AI for a fallback
-  5. Feed all results back to AI for final threat analysis
-  6. Return complete structured results
+  1. Detect OS + inventory all available tools
+  2. Identify file type + query threat intelligence
+  3. Agentic static loop: AI picks one tool at a time, sees each result, decides next
+  4. Agentic dynamic loop (optional): ordered behavioral analysis
+  5. Final AI synthesis across all collected data
+  6. Post-analysis: SQLite DB save + auto-YARA generation
 """
 
 import json
 import re
 import subprocess
 import shutil
+import threading
 import time
 import sys
 from pathlib import Path
 from typing import Optional, Callable
+
+# Thread-local storage for the web UI skip/stop events (set per analysis thread)
+_tls = threading.local()
+
+def set_skip_event(event: Optional[threading.Event]) -> None:
+    """Called by the web server to arm the skip signal for this analysis thread."""
+    _tls.skip_event = event
+
+def set_stop_event(event: Optional[threading.Event]) -> None:
+    """Called by the web server to arm the stop signal for this analysis thread."""
+    _tls.stop_event = event
 
 from malyze.core.environment import (
     get_os_info, scan_all_tools, get_available_tools,
@@ -26,57 +38,23 @@ from malyze.core.environment import (
 from malyze.core.file_identifier import identify_file
 from malyze.core.tool_registry import CATALOG, get_tool_info
 
+# Safe import of intel helpers — guarded so missing sqlite3/requests doesn't crash
+try:
+    from malyze.intel.sample_db import lookup_hash, find_by_imphash
+    _SAMPLE_DB_AVAILABLE = True
+except Exception:
+    _SAMPLE_DB_AVAILABLE = False
+    lookup_hash = find_by_imphash = None  # type: ignore
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Planner prompt
-# ─────────────────────────────────────────────────────────────────────────────
-
-PLANNER_SYSTEM = """You are a malware analysis automation engine.
-Your job is to create an ordered analysis plan for a given file.
-You MUST respond with ONLY valid JSON — no markdown, no explanation outside JSON.
-
-Return exactly this structure:
-{
-  "reasoning": "one sentence explaining your choices",
-  "steps": [
-    {
-      "tool_id": "<tool_id from available list>",
-      "reason": "why this tool",
-      "priority": 1,
-      "required": true
-    }
-  ]
-}
-
-Rules:
-- Use ONLY tool_ids from the Available Tools list
-- Order steps by analysis priority (identification first, then static, then dynamic)
-- Mark as required:true only the most critical steps
-- If the file type doesn't support a tool, skip it
-- Prefer Python-native tools over CLI tools when both exist (more reliable)
-- Always include: file_hashes, file_id, entropy
-- For PE files always include: pefile, strings_python or floss or strings_cli
-- For scripts include: strings_python and relevant script tools
-"""
-
-PLANNER_USER_TEMPLATE = """{env_summary}
-
-## Instruction
-Create an analysis plan for the file above.
-Focus on tools that will reveal: file type, packers, imports/exports, strings,
-IOCs (URLs/IPs/domains), suspicious APIs, obfuscation, capabilities.
-
-Available tool IDs (use ONLY these): {available_ids}
-
-File type: {file_type}
-"""
+# Known small models that are unreliable for agentic JSON decisions
+_WEAK_MODELS = {"llama3.2", "llama3.2:latest", "llama3.2:3b", "phi3:mini", "gemma:2b", "tinyllama"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tool runner dispatch
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _run_tool(tool_id: str, file_path: str, env_scan: dict, cfg: dict) -> dict:
+def _run_tool(tool_id: str, file_path: str, env_scan: dict, cfg: dict, tool_args: str = "") -> dict:
     """
     Execute a specific tool and return its output.
     Returns: {success, output, error}
@@ -129,6 +107,25 @@ def _run_tool(tool_id: str, file_path: str, env_scan: dict, cfg: dict) -> dict:
         result = analyze_office(file_path, file_info["type"])
         return {"success": True, "output": result}
 
+    if tool_id == "shodan":
+        from malyze.intel.deep_intel import lookup_shodan
+        api_key = cfg.get("intel", {}).get("shodan_api_key", "")
+        result = lookup_shodan(tool_args, api_key)
+        if result.get("error"):
+            return {"success": False, "error": result["error"]}
+        return {"success": True, "output": result}
+
+    if tool_id == "otx":
+        from malyze.intel.deep_intel import lookup_otx
+        api_key = cfg.get("intel", {}).get("otx_api_key", "")
+        ind_type = "IPv4"
+        if tool_args and any(c.isalpha() for c in tool_args):
+            ind_type = "domain"
+        result = lookup_otx(tool_args, ind_type, api_key)
+        if result.get("error"):
+            return {"success": False, "error": result["error"]}
+        return {"success": True, "output": result}
+
     # ── Python library tools ──────────────────────────────────────────────
     if tool_id == "pefile":
         from malyze.static.pe_analyzer import analyze_pe
@@ -155,6 +152,13 @@ def _run_tool(tool_id: str, file_path: str, env_scan: dict, cfg: dict) -> dict:
 
     if tool_id == "pyelftools":
         return _run_pyelftools(file_path)
+
+    if tool_id == "speakeasy":
+        from malyze.static.emulation_analyzer import analyze_with_speakeasy
+        result = analyze_with_speakeasy(file_path)
+        if result.get("error"):
+            return {"success": False, "error": result["error"]}
+        return {"success": True, "output": result}
 
     # ── CLI tools ─────────────────────────────────────────────────────────
     if tool_id == "floss":
@@ -221,6 +225,121 @@ def _run_cli_capture(bin_path: Optional[str], args: list, timeout: int = 60) -> 
         return {"success": False, "error": str(e)}
 
 
+# Tools that are slow enough to warrant offering a skip
+SKIPPABLE_TOOLS = {"floss", "capa", "die", "binwalk", "objdump"}
+
+
+def _run_cli_skippable(bin_path: str, args: list, timeout: int = 60) -> dict:
+    """
+    Run a CLI subprocess with live N-to-skip support.
+    While the tool is running, the user can press N (or Ctrl+N) to kill
+    the process and move on to the next tool.
+    Returns the standard result dict, plus 'skipped': True when user skips.
+    """
+    import threading
+
+    if not bin_path:
+        return {"success": False, "error": "Binary path not found"}
+
+    proc_box   = [None]
+    result_box = [None]
+    done_event = threading.Event()
+
+    def _worker():
+        try:
+            proc = subprocess.Popen(
+                [bin_path] + args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            proc_box[0] = proc
+            stdout_b, stderr_b = proc.communicate(timeout=timeout)
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            output = stdout + stderr
+            if proc.returncode != 0 and not output.strip():
+                result_box[0] = {"success": False,
+                                 "error": f"Exit {proc.returncode}: {output[:500]}"}
+            else:
+                result_box[0] = {"success": True,
+                                 "output": {"text": output, "exit_code": proc.returncode}}
+        except subprocess.TimeoutExpired:
+            if proc_box[0]:
+                proc_box[0].kill()
+            result_box[0] = {"success": False, "error": f"Timed out after {timeout}s"}
+        except FileNotFoundError:
+            result_box[0] = {"success": False, "error": f"Binary not found: {bin_path}"}
+        except Exception as exc:
+            result_box[0] = {"success": False, "error": str(exc)}
+        finally:
+            done_event.set()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    # ── Skip signal from web UI (thread-local event) ─────────────────────────
+    web_skip = getattr(_tls, "skip_event", None)
+
+    def _check_web_skip() -> bool:
+        if web_skip and web_skip.is_set():
+            web_skip.clear()
+            proc = proc_box[0]
+            if proc and proc.poll() is None:
+                proc.terminate()
+            done_event.wait(timeout=2)
+            return True
+        return False
+
+    # ── Keypress polling loop ────────────────────────────────────────────────
+    try:
+        import msvcrt  # Windows
+        while not done_event.wait(timeout=0.15):
+            if _check_web_skip():
+                return {"success": False, "skipped": True, "error": "Skipped via Web UI"}
+            if msvcrt.kbhit():
+                ch = msvcrt.getch()
+                # Accept: n, N, or Ctrl+N (0x0E)
+                if ch in (b"n", b"N", b"\x0e"):
+                    proc = proc_box[0]
+                    if proc and proc.poll() is None:
+                        proc.terminate()
+                    done_event.wait(timeout=2)
+                    return {"success": False, "skipped": True,
+                            "error": "Skipped by user (N)"}
+    except ImportError:
+        # Linux / no msvcrt — try select-based non-blocking read on stdin
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while not done_event.wait(timeout=0.0):
+                if _check_web_skip():
+                    return {"success": False, "skipped": True, "error": "Skipped via Web UI"}
+                ready, _, _ = select.select([sys.stdin], [], [], 0.15)
+                if ready:
+                    ch = sys.stdin.read(1)
+                    if ch.lower() == "n":
+                        proc = proc_box[0]
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                        done_event.wait(timeout=2)
+                        return {"success": False, "skipped": True,
+                                "error": "Skipped by user (N)"}
+        except Exception:
+            done_event.wait(timeout=timeout + 5)
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+    thread.join()
+    return result_box[0] or {"success": False, "error": "Tool returned no result"}
+
+
 def _run_die(bin_path: Optional[str], file_path: str) -> dict:
     if not bin_path:
         return {"success": False, "error": "diec not found"}
@@ -261,7 +380,9 @@ def _run_floss(bin_path: Optional[str], file_path: str) -> dict:
 
     last_error = ""
     for args in arg_variants:
-        result = _run_cli_capture(bin_path, args, timeout=180)
+        result = _run_cli_skippable(bin_path, args, timeout=300)
+        if result.get("skipped"):
+            return result
         if result.get("success"):
             return result
         err = result.get("error", "").lower()
@@ -290,7 +411,9 @@ def _run_capa(bin_path: Optional[str], file_path: str) -> dict:
 
     # Try verbose JSON first; fall back to plain JSON
     for args in (["-v", "--json", file_path], ["--json", file_path]):
-        result = _run_cli_capture(bin_path, args, timeout=360)
+        result = _run_cli_skippable(bin_path, args, timeout=360)
+        if result.get("skipped"):
+            return result   # propagate skip immediately
         if result.get("success"):
             break
     else:
@@ -499,61 +622,8 @@ def _run_pyelftools(file_path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI Planner
+# Deterministic fallback plan (used by AgenticOrchestrator when AI is offline)
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _ask_ai_for_plan(
-    env_summary: str,
-    file_type: str,
-    available_ids: list,
-    ollama_host: str,
-    model: str,
-    timeout: int = 60,
-) -> Optional[dict]:
-    """
-    Ask Ollama to return a JSON analysis plan.
-    Returns parsed plan dict or None on failure.
-    """
-    import requests
-
-    user_msg = PLANNER_USER_TEMPLATE.format(
-        env_summary=env_summary,
-        available_ids=json.dumps(available_ids),
-        file_type=file_type,
-    )
-    payload = {
-        "model":  model,
-        "messages": [
-            {"role": "system", "content": PLANNER_SYSTEM},
-            {"role": "user",   "content": user_msg},
-        ],
-        "stream": False,
-        "options": {"temperature": 0.0, "num_predict": 1024},
-    }
-
-    try:
-        resp = requests.post(f"{ollama_host}/api/chat", json=payload, timeout=timeout)
-        resp.raise_for_status()
-        content = resp.json().get("message", {}).get("content", "")
-
-        # Try to parse JSON directly
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            pass
-
-        # Extract JSON block from markdown code fences or bare text
-        match = re.search(r"\{[\s\S]*\}", content)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-
-        return None
-    except Exception:
-        return None
-
 
 def _build_fallback_plan(file_type: str, available_ids: list) -> dict:
     """
@@ -568,11 +638,14 @@ def _build_fallback_plan(file_type: str, available_ids: list) -> dict:
             ("file_id",       "Confirm PE type, subtype, magic bytes",             True),
             ("entropy",       "Detect packing/encryption via Shannon entropy",     True),
             ("die",           "Identify compiler, linker, packer (Detect-It-Easy)", True),
+            ("speakeasy",     "Emulate binary to extract APIs and payloads statically", True),
             ("upx",           "Confirm/test UPX packing",                          False),
             ("floss",         "Extract obfuscated strings (FLARE FLOSS)",           True),
             ("strings_cli",   "Fast string extraction (Sysinternals strings)",      False),
             ("strings_python","String extraction fallback",                         False),
             ("pefile",        "Parse PE headers, imports, exports, sections",       True),
+            ("shodan",        "Check IP addresses in Shodan",                       False),
+            ("otx",           "Check IPs/domains in OTX",                           False),
             ("capstone",      "Disassemble from entry point",                       True),
             ("yara_python",   "Scan against packer/malware YARA rules",             True),
             ("yara_cli",      "YARA CLI scan",                                      False),
@@ -756,6 +829,7 @@ class MalyzeAgent:
         file_path: str,
         analyst_name: str = "Analyst",
         run_dynamic: bool = False,
+        run_static: bool = True,
     ) -> dict:
         import datetime
         from malyze.core.orchestrator import (
@@ -784,15 +858,23 @@ class MalyzeAgent:
         self.log("Malyzer — AI-Driven Malware Analysis")
         self.log(f"Analyst: {analyst_name}   Sample: {Path(file_path).name}")
         self.log("=" * 62)
+
+        # Model quality gate — warn early so the analyst knows what to expect
+        model = self.ollama.get("model", "llama3.2")
+        if model.split(":")[0] in _WEAK_MODELS or model in _WEAK_MODELS:
+            self.log(f"\n  [WARN] Model '{model}' is a small (3B) model.", "warning")
+            self.log("  [WARN] Agentic JSON decisions may be unreliable.", "warning")
+            self.log("  [WARN] Recommended: mistral:7b, qwen2.5:7b, or llama3.1:8b", "warning")
+
         self.log("\n[1/7] Scanning OS and available tools...")
 
         os_info  = get_os_info()
         env_scan = scan_all_tools(self.cfg)
 
         static_tools  = [t for t, i in env_scan.items()
-                         if i.get("available") and not i.get("dynamic_only")]
+                         if i.get("available") and i.get("category") != "dynamic"]
         dynamic_tools = [t for t, i in env_scan.items()
-                         if i.get("available") and i.get("dynamic_only")]
+                         if i.get("available") and i.get("category") == "dynamic"]
         miss          = [t for t, i in env_scan.items()
                          if not i.get("available") and not i.get("skip")]
 
@@ -820,17 +902,17 @@ class MalyzeAgent:
 
         db_path = str(Path(self.cfg.get("output", {}).get("dir", "./output")) / "samples.db")
         intel_summary = ""
-        try:
-            from malyze.intel.sample_db import lookup_hash, find_by_imphash
-            known = lookup_hash(file_info["hashes"]["sha256"], db_path)
-            if known:
-                self.log(f"      [DB ] Previously analysed — family: {known.get('malware_family')}, "
-                         f"level: {known.get('threat_level')}")
-                results["previously_analysed"] = known
-                intel_summary += (f"Previously analysed: family={known.get('malware_family')}, "
-                                  f"level={known.get('threat_level')}. ")
-        except Exception:
-            pass
+        if _SAMPLE_DB_AVAILABLE:
+            try:
+                known = lookup_hash(file_info["hashes"]["sha256"], db_path)
+                if known:
+                    self.log(f"      [DB ] Previously analysed — family: {known.get('malware_family')}, "
+                             f"level: {known.get('threat_level')}")
+                    results["previously_analysed"] = known
+                    intel_summary += (f"Previously analysed: family={known.get('malware_family')}, "
+                                      f"level={known.get('threat_level')}. ")
+            except Exception:
+                pass
 
         try:
             from malyze.intel.lookup import enrich_sample
@@ -849,13 +931,8 @@ class MalyzeAgent:
 
         print_missing_tool_recommendations(env_scan, file_type, self.log)
 
-        # ── Step 3/7: Agentic Static Analysis Loop ─────────────────────────
-        self.log("\n[3/7] Starting agentic static analysis loop...")
-        self.log(f"      AI will select tools one at a time from {len(static_tools)} "
-                 f"available static tools")
-
+        # ctx is always created — dynamic analysis needs it even if static is skipped
         available_ids = [t for t, i in env_scan.items() if i.get("available")]
-
         ctx = AnalysisContext(
             file_path       = file_path,
             file_type       = file_type,
@@ -864,56 +941,166 @@ class MalyzeAgent:
             intel_summary   = intel_summary,
             available_tools = available_ids,
         )
+        iter_log  = []
+        collected = {}
 
-        agentic = AgenticOrchestrator(self.cfg, self.log)
-        collected, iter_log = agentic.run(ctx)
+        # ── Step 3/7: Agentic Static Analysis Loop ─────────────────────────
+        if run_static:
+            self.log("\n[3/7] Starting agentic static analysis loop...")
+            self.log(f"      AI will select tools one at a time from {len(static_tools)} "
+                     f"available static tools")
 
-        results["static"]        = _normalise_static(collected)
-        results["iteration_log"] = iter_log
-        results["tool_log"]      = [
-            {"tool": entry.get("tool"), "status": "ok", "reason": entry.get("reason", "")}
-            for entry in iter_log if entry.get("tool")
-        ]
+            stop_ev = getattr(_tls, "stop_event", None)
+            agentic = AgenticOrchestrator(self.cfg, env_scan, self.log, stop_event=stop_ev)
+            collected, iter_log = agentic.run(ctx)
 
-        self.log(f"      Static loop complete — {len(iter_log)} iterations, "
-                 f"{len(collected)} tools ran")
+            results["static"]        = _normalise_static(collected)
+            results["iteration_log"] = iter_log
+            results["tool_log"]      = [
+                {
+                    "tool":   entry.get("tool_id", "?"),
+                    "status": entry.get("status", "ok"),
+                    "reason": entry.get("reasoning", ""),
+                }
+                for entry in iter_log if entry.get("tool_id")
+            ]
 
-        # XOR brute force for binary file types
-        if file_type in ("PE", "PE_DLL", "PE_DRIVER", "ELF", "ELF_KERNEL", "UNKNOWN"):
-            self.log("      Running XOR brute force deobfuscation (1 & 2-byte keys)...")
-            try:
-                from malyze.static.strings_extractor import xor_brute_force
-                xor_result = xor_brute_force(file_path, key_sizes=(1, 2))
-                results["static"]["xor_deobfuscation"] = xor_result
-                if xor_result.get("found_payloads"):
-                    n = len(xor_result.get("candidates", []))
-                    self.log(f"      [XOR ] Found {n} promising XOR key candidate(s)")
-                else:
-                    self.log("      [XOR ] No XOR-obfuscated payload detected")
-            except Exception as exc:
-                self.log(f"      [XOR ] Brute force failed: {exc}", "warning")
+            self.log(f"      Static loop complete — {len(iter_log)} iterations, "
+                     f"{len(collected)} tools ran")
 
-        # Similar sample lookup by imphash
-        imphash = results["static"].get("pe", {}).get("imphash")
-        if imphash:
-            try:
-                similar = find_by_imphash(imphash, db_path)
-                if similar:
-                    results["similar_samples"] = similar
-                    self.log(f"      [DB ] Found {len(similar)} similar sample(s) by imphash")
-            except Exception:
-                pass
+            # XOR brute force for binary file types
+            if file_type in ("PE", "PE_DLL", "PE_DRIVER", "ELF", "ELF_KERNEL", "UNKNOWN"):
+                self.log("      Running XOR brute force deobfuscation (1 & 2-byte keys)...")
+                try:
+                    from malyze.static.strings_extractor import xor_brute_force
+                    xor_result = xor_brute_force(file_path, key_sizes=(1, 2))
+                    results["static"]["xor_deobfuscation"] = xor_result
+                    if xor_result.get("found_payloads"):
+                        n = len(xor_result.get("candidates", []))
+                        self.log(f"      [XOR ] Found {n} promising XOR key candidate(s)")
+                    else:
+                        self.log("      [XOR ] No XOR-obfuscated payload detected")
+                except Exception as exc:
+                    self.log(f"      [XOR ] Brute force failed: {exc}", "warning")
 
-        # ── Step 4/7: Tool Inventory Report ────────────────────────────────
-        self.log("\n[4/7] Tool inventory and AI reasoning log:")
-        for i, entry in enumerate(iter_log, 1):
-            tool    = entry.get("tool", "?")
-            reason  = entry.get("reason", "")
-            outcome = "OK" if entry.get("success") else "FAIL"
-            self.log(f"      [{i:02d}] {outcome} {tool} — {reason[:70]}")
-        hypotheses = [e.get("hypothesis", "") for e in iter_log if e.get("hypothesis")]
-        if hypotheses:
-            self.log(f"      Final AI hypothesis: {hypotheses[-1][:120]}")
+            # Auto-unpack if a packer was detected
+            packer_found = bool(results["static"].get("packer", {}).get("detected_packers"))
+            if packer_found and file_type in ("PE", "PE_DLL", "PE_DRIVER"):
+                self.log("      Packer detected — attempting automatic unpacking...")
+                try:
+                    from malyze.static.unpacker import try_unpack, cleanup_unpacked
+                    unpack_result = try_unpack(file_path, self.cfg)
+                    if unpack_result.get("success"):
+                        method  = unpack_result["method"]
+                        up_path = unpack_result["unpacked_path"]
+                        ratio   = (unpack_result["unpacked_size"] / max(unpack_result["original_size"], 1))
+                        self.log(f"      [UNPACK] {method} succeeded — "
+                                 f"unpacked {unpack_result['unpacked_size']:,} bytes "
+                                 f"({ratio:.1f}x original)")
+                        try:
+                            from malyze.static.strings_extractor import _extract_python, categorize_strings
+                            with open(up_path, "rb") as _f:
+                                _data = _f.read()
+                            min_len = self.cfg.get("analysis", {}).get("string_min_length", 4)
+                            max_s   = self.cfg.get("analysis", {}).get("max_strings", 5000)
+                            raw = _extract_python(_data, min_len)[:max_s]
+                            results["static"]["strings_unpacked"] = {
+                                "source": f"unpacked_{method}",
+                                "total":  len(raw),
+                                "strings": raw,
+                                "iocs":   categorize_strings(raw),
+                            }
+                            self.log(f"      [UNPACK] Re-extracted {len(raw)} strings from unpacked binary")
+                        except Exception as exc:
+                            self.log(f"      [UNPACK] String re-extraction failed: {exc}", "warning")
+                        cleanup_unpacked(up_path)
+                        results["static"]["unpacked"] = {
+                            "success": True, "method": method,
+                            "unpacked_size": unpack_result["unpacked_size"],
+                        }
+                    else:
+                        tried = ", ".join(unpack_result.get("tried", []))
+                        self.log(f"      [UNPACK] Auto-unpack failed (tried: {tried or 'none available'})")
+                        results["static"]["unpacked"] = {"success": False, "tried": unpack_result.get("tried", [])}
+                except Exception as exc:
+                    self.log(f"      [UNPACK] Unpacker error: {exc}", "warning")
+
+            # Similar sample lookup by imphash
+            imphash = results["static"].get("pe", {}).get("imphash")
+            if imphash and _SAMPLE_DB_AVAILABLE:
+                try:
+                    similar = find_by_imphash(imphash, db_path)
+                    if similar:
+                        results["similar_samples"] = similar
+                        self.log(f"      [DB ] Found {len(similar)} similar sample(s) by imphash")
+                except Exception:
+                    pass
+
+            # ── Step 4/7: Tool Inventory Report ────────────────────────────
+            self.log("\n[4/7] Tool inventory and AI reasoning log:")
+            for i, entry in enumerate(iter_log, 1):
+                tool    = entry.get("tool_id", "?")
+                reason  = entry.get("reasoning", "")
+                status  = entry.get("status", "ok")
+                outcome = "OK  " if status.startswith("ok") else "FAIL"
+                self.log(f"      [{i:02d}] {outcome} {tool} — {reason[:70]}")
+            all_hyps = []
+            for e in iter_log:
+                hyps = e.get("hypotheses", [])
+                if isinstance(hyps, list):
+                    all_hyps.extend(h for h in hyps if h)
+                elif hyps:
+                    all_hyps.append(str(hyps))
+            if all_hyps:
+                self.log(f"      Final AI hypothesis: {all_hyps[-1][:120]}")
+
+        else:
+            self.log("\n[3/7] Static analysis skipped")
+            results["static"]        = {}
+            results["iteration_log"] = []
+            results["tool_log"]      = []
+
+        # ── Step 4.5: IOC Enrichment ───────────────────────────────────────
+        self.log("\n[4.5/7] Enriching extracted IOCs (geo-IP + URLhaus)...")
+        try:
+            from malyze.intel.enrichment import enrich_iocs
+            # Collect IPs, domains, URLs from strings analysis
+            raw_iocs: dict = {}
+            s_iocs = results.get("static", {}).get("strings", {}).get("iocs", {})
+            for cat, items in s_iocs.items():
+                raw_iocs.setdefault(cat, []).extend(items)
+            # Also pull from script analysis IOCs if present
+            sc_iocs = results.get("static", {}).get("script", {}).get("iocs", {})
+            for cat, items in sc_iocs.items():
+                raw_iocs.setdefault(cat, []).extend(items)
+            # De-duplicate
+            for cat in raw_iocs:
+                raw_iocs[cat] = list(dict.fromkeys(raw_iocs[cat]))
+
+            enriched = enrich_iocs(raw_iocs, self.cfg)
+            results["enriched_iocs"] = enriched
+
+            stats = enriched.get("_stats", {})
+            flagged = (
+                sum(1 for e in enriched.get("ips", []) if e.get("urlhaus_hits") or e.get("is_proxy"))
+                + sum(1 for e in enriched.get("domains", []) if e.get("urlhaus_hits"))
+                + sum(1 for e in enriched.get("urls", []) if e.get("urlhaus_hits"))
+            )
+            self.log(f"      Enriched: {stats.get('ips_queried',0)} IPs, "
+                     f"{stats.get('domains_queried',0)} domains, "
+                     f"{stats.get('urls_queried',0)} URLs — "
+                     f"{flagged} threat hits")
+            if flagged:
+                # Log the worst offenders prominently
+                for e in enriched.get("ips", []):
+                    if e.get("urlhaus_hits"):
+                        self.log(f"      [THREAT] IP {e['ip']} → URLhaus {e['urlhaus_hits']} hits", "warning")
+                for e in enriched.get("domains", []):
+                    if e.get("urlhaus_hits"):
+                        self.log(f"      [THREAT] Domain {e['domain']} → URLhaus {e['urlhaus_hits']} hits", "warning")
+        except Exception as exc:
+            self.log(f"      [ENRICH] IOC enrichment skipped: {exc}", "warning")
+            results["enriched_iocs"] = {}
 
         # ── Step 5/7: Agentic Dynamic Analysis ─────────────────────────────
         if run_dynamic:
@@ -921,14 +1108,20 @@ class MalyzeAgent:
             self.log(f"      {len(dynamic_tools)} dynamic tools available: "
                      f"{', '.join(dynamic_tools[:8])}")
             try:
-                dyn_orch = DynamicOrchestrator(self.cfg, self.log)
+                dyn_out = str(Path(self.cfg.get("output", {}).get("dir", "./output")) / "dynamic")
+                dyn_orch = DynamicOrchestrator(self.cfg, env_scan, dyn_out, self.log,
+                                               stop_event=getattr(_tls, "stop_event", None))
                 dyn_result, dyn_log = dyn_orch.run(ctx, file_path)
                 results["dynamic"]      = dyn_result
                 results["dynamic_log"]  = dyn_log
                 self.log(f"      Dynamic loop complete — {len(dyn_log)} iterations")
                 results["tool_log"] += [
-                    {"tool": e.get("tool"), "status": "dynamic_ok", "reason": e.get("reason", "")}
-                    for e in dyn_log if e.get("tool")
+                    {
+                        "tool":   e.get("tool_id", "?"),
+                        "status": "dynamic_" + e.get("status", "ok"),
+                        "reason": e.get("reasoning", ""),
+                    }
+                    for e in dyn_log if e.get("tool_id")
                 ]
             except Exception as exc:
                 self.log(f"      Dynamic analysis failed (pipeline continues): {exc}", "warning")
@@ -955,6 +1148,7 @@ class MalyzeAgent:
             host          = self.ollama.get("host",    "http://localhost:11434"),
             model         = self.ollama.get("model",   "llama3.2"),
             timeout       = self.ollama.get("timeout", 300),
+            api_key       = self.ollama.get("api_key", ""),
         )
         results["ai_analysis"] = ai_result
         if ai_result.get("error"):

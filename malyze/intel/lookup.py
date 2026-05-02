@@ -1,17 +1,22 @@
 """
-Threat intel hash lookups — MalwareBazaar (free) and VirusTotal (API key optional).
+Threat intel hash lookups.
 
-MalwareBazaar requires no API key.
-VirusTotal requires a free API key (set in config: intel.virustotal_api_key).
+Free sources (no key):
+  MalwareBazaar  — abuse.ch, always enabled
+  CIRCL HashLookup — CIRCL.lu community hash DB (10M+ known-good + known-bad)
+
+Key-gated sources (optional):
+  VirusTotal v3  — 60-70 AV engines; free tier = 4 req/min
 """
 
 import requests
 from typing import Optional
 
 
-_MB_API   = "https://mb-api.abuse.ch/api/v1/"
-_VT_API   = "https://www.virustotal.com/api/v3/files"
-_TIMEOUT  = 15
+_MB_API    = "https://mb-api.abuse.ch/api/v1/"
+_VT_API    = "https://www.virustotal.com/api/v3/files"
+_CIRCL_API = "https://hashlookup.circl.lu/lookup"
+_TIMEOUT   = 15
 
 
 def lookup_malwarebazaar(sha256: str) -> dict:
@@ -122,10 +127,51 @@ def lookup_virustotal(sha256: str, api_key: str) -> dict:
         return {"found": False, "source": "virustotal", "error": str(e)}
 
 
+def lookup_circl_hashlookup(sha256: str, md5: str = "", sha1: str = "") -> dict:
+    """
+    Query CIRCL HashLookup — free community hash database (no API key).
+
+    Covers 10M+ benign samples (NSRL) + known malware hashes.
+    Returns 'known_good': True for clean NSRL hits, 'known_bad': True for
+    malware-tagged hashes.
+    """
+    for algo, value in (("sha256", sha256), ("sha1", sha1), ("md5", md5)):
+        if not value:
+            continue
+        try:
+            resp = requests.get(
+                f"{_CIRCL_API}/{algo}/{value}",
+                headers={"Accept": "application/json"},
+                timeout=_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                d    = resp.json()
+                tags = d.get("tags", []) or []
+                return {
+                    "found":       True,
+                    "source":      "circl_hashlookup",
+                    "algo":        algo,
+                    "value":       value,
+                    "file_name":   d.get("FileName", ""),
+                    "product":     d.get("ProductName", ""),
+                    "known_good":  any("NSRL" in t or "known-good" in t.lower() for t in tags),
+                    "known_bad":   any("malware" in t.lower() or "malicious" in t.lower() for t in tags),
+                    "tags":        tags,
+                    "raw":         d,
+                }
+            if resp.status_code == 404:
+                continue  # try next algo
+        except requests.Timeout:
+            return {"found": False, "source": "circl_hashlookup", "error": "timeout"}
+        except Exception as e:
+            return {"found": False, "source": "circl_hashlookup", "error": str(e)}
+    return {"found": False, "source": "circl_hashlookup"}
+
+
 def enrich_sample(hashes: dict, config: dict) -> dict:
     """
     Perform all configured threat intel lookups for a sample.
-    Always tries MalwareBazaar (free). Tries VirusTotal if API key is configured.
+    Free sources always run. Key-gated sources run only when configured.
 
     Returns combined result dict keyed by source name.
     """
@@ -136,11 +182,18 @@ def enrich_sample(hashes: dict, config: dict) -> dict:
     intel_cfg = config.get("intel", {})
     results   = {}
 
-    # MalwareBazaar — always attempt
+    # MalwareBazaar — always attempt (free, no key)
     if intel_cfg.get("malwarebazaar", True):
         results["malwarebazaar"] = lookup_malwarebazaar(sha256)
 
-    # VirusTotal — only if key is configured
+    # CIRCL HashLookup — always attempt (free, no key)
+    results["circl_hashlookup"] = lookup_circl_hashlookup(
+        sha256=sha256,
+        md5=hashes.get("md5", ""),
+        sha1=hashes.get("sha1", ""),
+    )
+
+    # VirusTotal — only if key is configured (60-70 AV engines)
     vt_key = intel_cfg.get("virustotal_api_key", "")
     if vt_key and not vt_key.startswith("YOUR_"):
         results["virustotal"] = lookup_virustotal(sha256, vt_key)
@@ -156,8 +209,17 @@ def enrich_sample(hashes: dict, config: dict) -> dict:
                 if fam:
                     families.append(fam)
 
+    # A CIRCL "found" hit that is known_good (NSRL) should NOT mark as malware
+    def _is_malware_hit(src_key: str, r: dict) -> bool:
+        if not isinstance(r, dict) or not r.get("found"):
+            return False
+        if src_key == "circl_hashlookup":
+            return bool(r.get("known_bad"))
+        return True
+
     results["_summary"] = {
-        "known_malware":    any(r.get("found") for r in results.values() if isinstance(r, dict)),
+        "known_malware":    any(_is_malware_hit(k, v) for k, v in results.items()),
+        "circl_known_good": bool(results.get("circl_hashlookup", {}).get("known_good")),
         "consensus_family": families[0] if families else None,
         "all_families":     list(dict.fromkeys(families))[:5],
     }

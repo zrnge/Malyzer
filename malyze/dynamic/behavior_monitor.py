@@ -68,12 +68,19 @@ class BehaviorMonitor:
     All errors are caught and stored as partial results — run() never raises.
     """
 
-    def __init__(self, config: dict, output_dir: str):
+    def __init__(self, config: dict, output_dir: str, log_fn=None):
         self.cfg = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._tracked: list = []                       # (label, Popen) pairs
         self._procmon_proc: Optional[subprocess.Popen] = None
+        self._log_fn = log_fn or print
+
+    def _log(self, msg: str, level: str = "info") -> None:
+        try:
+            self._log_fn(msg, level)
+        except TypeError:
+            self._log_fn(msg)
 
     # ------------------------------------------------------------------
     # Tool resolution
@@ -166,57 +173,137 @@ class BehaviorMonitor:
                 self._taskkill("Procmon64.exe")
                 self._taskkill("Procmon.exe")
         else:
-            # Procmon already exited on its own — normal; give it a moment to
-            # finish flushing its PML backing file before we read it.
-            time.sleep(1)
+            # Procmon already exited on its own — normal.
+            pass
+        # Always wait for the PML backing file to finish flushing before
+        # a new Procmon instance opens it for CSV export.
+        time.sleep(3)
 
     def _export_csv(self, pml_path: str) -> str:
         """Convert PML → CSV using Procmon's headless /OpenLog /SaveAs mode."""
         csv_path = pml_path.replace(".pml", ".csv")
         tool = self._find_tool("procmon")
-        if tool and Path(pml_path).exists():
-            _run_detached(
-                [tool, "/OpenLog", pml_path, "/SaveAs", csv_path, "/Quiet"],
-                timeout=60,
+        pml  = Path(pml_path)
+
+        if not tool:
+            self._log(f"      [DYN] _export_csv: Procmon binary not found")
+            return csv_path
+
+        if not pml.exists():
+            self._log(f"      [DYN] _export_csv: PML not found at {pml_path}")
+            return csv_path
+
+        pml_size = pml.stat().st_size
+        self._log(f"      [DYN] Exporting PML → CSV  ({pml_size:,} bytes) ...")
+
+        if pml_size == 0:
+            self._log(f"      [DYN] _export_csv: PML is empty (0 bytes) — Procmon may lack admin rights")
+            return csv_path
+
+        # Use subprocess.run directly so we can capture exit code + stderr.
+        # /AcceptEula — suppresses the EULA dialog on fresh Procmon instances.
+        # Do NOT use /NoFilter — not supported on all Procmon versions.
+        try:
+            kw: dict = {"stdin": subprocess.DEVNULL, "capture_output": True}
+            if _IS_WINDOWS:
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = 0
+                kw["startupinfo"] = si
+                kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+            r = subprocess.run(
+                [tool, "/AcceptEula", "/OpenLog", pml_path, "/SaveAs", csv_path, "/Quiet"],
+                timeout=120,
+                **kw,
             )
+            if r.returncode != 0:
+                err = (r.stderr or b"").decode(errors="replace")[:300]
+                self._log(f"      [DYN] Procmon /SaveAs exited {r.returncode}: {err}", "warning")
+        except subprocess.TimeoutExpired:
+            self._log(f"      [DYN] Procmon /SaveAs timed out after 120s", "warning")
+        except Exception as exc:
+            self._log(f"      [DYN] Procmon /SaveAs failed: {exc}", "warning")
+
+        if Path(csv_path).exists():
+            self._log(f"      [DYN] CSV exported: {Path(csv_path).stat().st_size:,} bytes")
+        else:
+            self._log(f"      [DYN] CSV still missing after export — check Procmon permissions", "warning")
+            time.sleep(3)   # one last grace period
+
         return csv_path
 
     # ------------------------------------------------------------------
     # Sample execution  (also detached — malware must not touch our terminal)
     # ------------------------------------------------------------------
     def _execute_sample(self, sample_path: str, timeout: int) -> dict:
+        import time as _time
+        out_file = self.output_dir / "sample_stdout.txt"
+        err_file = self.output_dir / "sample_stderr.txt"
+
         try:
-            # Use PIPE for stdout/stderr so we can capture output, but still
-            # apply all the detached flags so the sample can't own our console.
             extra = {}
             if _IS_WINDOWS:
                 si = subprocess.STARTUPINFO()
                 si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 si.wShowWindow = 0
                 extra["startupinfo"] = si
+                # CREATE_NEW_PROCESS_GROUP so we can send CTRL_BREAK to the whole group.
+                # Avoid PIPE — if the sample spawns children they inherit pipe handles
+                # and communicate() blocks until ALL holders exit (hangs entire analysis).
                 extra["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP |
                                           subprocess.CREATE_NO_WINDOW)
 
-            proc = subprocess.Popen(
-                [sample_path],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(Path(sample_path).parent),
-                **extra,
-            )
+            with open(out_file, "wb") as fout, open(err_file, "wb") as ferr:
+                proc = subprocess.Popen(
+                    [sample_path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=fout,
+                    stderr=ferr,
+                    cwd=str(Path(sample_path).parent),
+                    **extra,
+                )
+
+            t_start   = _time.time()
+            timed_out = False
             try:
-                out, err = proc.communicate(timeout=timeout)
-                return {
-                    "pid":       proc.pid,
-                    "exit_code": proc.returncode,
-                    "stdout":    out.decode("utf-8", errors="replace")[:2000],
-                    "stderr":    err.decode("utf-8", errors="replace")[:2000],
-                    "timed_out": False,
-                }
+                proc.wait(timeout=timeout)
+                exit_code = proc.returncode
             except subprocess.TimeoutExpired:
-                proc.kill()
-                return {"pid": proc.pid, "exit_code": None, "timed_out": True}
+                timed_out = True
+                exit_code = None
+                # Kill the entire process tree so no orphaned children survive
+                try:
+                    import psutil
+                    parent = psutil.Process(proc.pid)
+                    for child in parent.children(recursive=True):
+                        try: child.kill()
+                        except Exception: pass
+                    parent.kill()
+                except Exception:
+                    try: proc.kill()
+                    except Exception: pass
+
+            elapsed = round(_time.time() - t_start, 1)
+
+            stdout = stderr = ""
+            try: stdout = out_file.read_text(errors="replace")[:2000]
+            except Exception: pass
+            try: stderr = err_file.read_text(errors="replace")[:2000]
+            except Exception: pass
+
+            return {
+                "pid":       proc.pid,
+                "exit_code": exit_code,
+                "timed_out": timed_out,
+                "elapsed_s": elapsed,
+                "stdout":    stdout,
+                "stderr":    stderr,
+            }
+
+        except FileNotFoundError:
+            return {"error": f"Executable not found: {sample_path}"}
+        except PermissionError:
+            return {"error": f"Permission denied — AV may be blocking execution: {sample_path}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -227,81 +314,187 @@ class BehaviorMonitor:
         log_path = self.output_dir / "fakenet.log"
         if not log_path.exists():
             return {"available": False}
+        import re as _re
         try:
             content = log_path.read_text(errors="replace")
-            lines = content.splitlines()
-            conns = [l for l in lines
-                     if "Connecting" in l or "Request" in l or "DNS" in l]
+            lines   = content.splitlines()
+
+            dns_queries:    list = []
+            http_requests:  list = []
+            tcp_connections: list = []
+            seen_dns: set = set()
+            seen_conn: set = set()
+
+            for line in lines:
+                # DNS: "DNS request for evil.com" / "Received DNS request for"
+                m = _re.search(
+                    r"DNS\s+(?:request|query|lookup)\s+for\s+([\w.\-]+)",
+                    line, _re.IGNORECASE,
+                )
+                if m:
+                    d = m.group(1).lower().rstrip(".")
+                    if d not in seen_dns:
+                        seen_dns.add(d)
+                        dns_queries.append(d)
+
+                # HTTP method line: GET /path HTTP/1.1
+                m = _re.search(
+                    r"\b(GET|POST|PUT|DELETE|HEAD|OPTIONS|CONNECT)\s+(\S+)\s+HTTP",
+                    line, _re.IGNORECASE,
+                )
+                if m:
+                    http_requests.append(f"{m.group(1).upper()} {m.group(2)}")
+
+                # HTTP Host header
+                m = _re.search(r"\bHost:\s*([\w.\-:]+)", line, _re.IGNORECASE)
+                if m:
+                    http_requests.append(f"Host: {m.group(1)}")
+
+                # TCP/UDP connection: IP:port patterns
+                m = _re.search(
+                    r"[Cc]onnect\w*\s+(?:from\s+[\d.]+\s+to\s+)?([\d]{1,3}(?:\.[\d]{1,3}){3}):(\d+)",
+                    line,
+                )
+                if m:
+                    ip, port = m.group(1), m.group(2)
+                    key = f"{ip}:{port}"
+                    if key not in seen_conn and not ip.startswith(("127.", "0.", "255.")):
+                        seen_conn.add(key)
+                        tcp_connections.append({"ip": ip, "port": int(port)})
+
             return {
-                "available":   True,
-                "total_lines": len(lines),
-                "connections": conns[:200],
-                "raw_path":    str(log_path),
+                "available":       True,
+                "total_lines":     len(lines),
+                "dns_queries":     dns_queries[:50],
+                "http_requests":   list(dict.fromkeys(http_requests))[:50],
+                "tcp_connections": tcp_connections[:50],
+                "raw_path":        str(log_path),
             }
         except Exception as e:
             return {"available": False, "error": str(e)}
 
-    def _parse_procmon_csv(self, csv_path: str) -> dict:
+    def _parse_procmon_csv(
+        self,
+        csv_path: str,
+        sample_pid: str = "",
+        sample_name: str = "",
+    ) -> dict:
         """
-        Parse Procmon CSV using the column header row so we get structured data
-        regardless of column order. Procmon's default columns are:
-        Time of Day, Process Name, PID, Operation, Path, Result, Detail, TID, ...
+        Parse Procmon CSV into categorised event lists.
+
+        sample_pid / sample_name — events from the sample are placed at the
+        top of each list so the AI sees malware activity, not the thousands of
+        background events from Explorer / MsMpEng / Edge that dominate a
+        system-wide capture.
         """
         if not Path(csv_path).exists():
             return {"available": False}
         try:
             import csv as _csv
 
-            process_events: list  = []
-            file_events: list     = []
-            registry_events: list = []
-            network_events: list  = []
-            total_events          = 0
+            _NOISE = {
+                "explorer.exe", "msmpeng.exe", "msmeng.exe", "svchost.exe",
+                "msedge.exe", "chrome.exe", "firefox.exe",
+                "procmon64.exe", "procmon.exe", "system", "registry", "idle",
+                "searchindexer.exe", "taskhostw.exe", "ctfmon.exe",
+            }
+
+            # Paths that are Malyze tool artifacts — suppress even if sample wrote there.
+            # These would otherwise confuse the AI into thinking they are IOCs.
+            _output_dir_lower = str(self.output_dir).lower()
+            _NOISE_PATHS = {
+                # Prefetch writes are always done by the Windows Prefetch service
+                "c:\\windows\\prefetch",
+                # System32 DLL reads are normal loader activity
+                "c:\\windows\\system32",
+            }
+
+            def _is_noise_path(path: str) -> bool:
+                pl = path.lower()
+                if pl.startswith(_output_dir_lower):
+                    return True
+                return any(pl.startswith(p) for p in _NOISE_PATHS)
+
+            sample_pid  = str(sample_pid).strip()
+            sample_name = sample_name.strip().lower()
+
+            def _is_sample(pid: str, proc: str) -> bool:
+                if sample_pid and pid == sample_pid:
+                    return True
+                if sample_name and sample_name in proc.lower():
+                    return True
+                return False
+
+            buckets: dict = {
+                "process":  [[], []],
+                "file":     [[], []],
+                "registry": [[], []],
+                "network":  [[], []],
+            }
+            total_events = 0
 
             with open(csv_path, newline="", encoding="utf-8", errors="replace") as fh:
                 reader = _csv.DictReader(fh)
-                # Normalise header names (strip BOM, quotes, whitespace)
                 if reader.fieldnames:
                     reader.fieldnames = [
-                        f.strip().strip('"').strip("\ufeff") for f in reader.fieldnames
+                        f.strip().strip('"').strip("﻿") for f in reader.fieldnames
                     ]
 
                 for row in reader:
                     total_events += 1
-                    if total_events > 10_000:   # cap to avoid huge memory use
-                        break
 
                     op   = row.get("Operation", "").strip()
                     proc = row.get("Process Name", "").strip()
                     pid  = row.get("PID", "").strip()
                     path = row.get("Path", "").strip()
                     res  = row.get("Result", "").strip()
-                    det  = row.get("Detail", "")[:200].strip()
 
-                    summary = f"[{pid}] {proc} | {op} | {path} | {res}"
+                    summary  = f"[{pid}] {proc} | {op} | {path} | {res}"
+                    is_samp  = _is_sample(pid, proc)
+                    is_noise = (not is_samp) and (
+                        proc.lower() in _NOISE or _is_noise_path(path)
+                    )
 
-                    if op.startswith("Process"):
-                        if len(process_events) < 100:
-                            process_events.append(summary)
+                    if op.startswith("Process") or op == "Load Image" or op == "Thread Create":
+                        cat = "process"
                     elif op in ("ReadFile", "WriteFile", "CreateFile",
-                                "DeleteFile", "SetEndOfFile", "QueryInformationFile"):
-                        if len(file_events) < 100:
-                            file_events.append(summary)
+                                "DeleteFile", "SetEndOfFile", "QueryInformationFile",
+                                "RenameFile", "SetRenameInformationFile"):
+                        cat = "file"
                     elif op.startswith("Reg"):
-                        if len(registry_events) < 100:
-                            registry_events.append(summary)
+                        cat = "registry"
                     elif "TCP" in op or "UDP" in op or "Network" in op:
-                        if len(network_events) < 100:
-                            network_events.append(summary)
+                        cat = "network"
+                    else:
+                        continue
+
+                    samp_list, bg_list = buckets[cat]
+                    if is_samp:
+                        if len(samp_list) < 100:
+                            samp_list.append(summary)
+                    elif not is_noise:
+                        if len(bg_list) < 50:
+                            bg_list.append(summary)
+
+            def _merge(cat: str) -> list:
+                samp, bg = buckets[cat]
+                return (samp + bg)[:100]
+
+            db_path = str(self.output_dir / "procmon.db")
+            from malyze.dynamic.rag_db import DynamicEventsDB
+            db = DynamicEventsDB(db_path)
+            db.load_csv(csv_path)
 
             return {
                 "available":       True,
                 "total_events":    total_events,
-                "process_events":  process_events,
-                "file_events":     file_events,
-                "registry_events": registry_events,
-                "network_events":  network_events,
+                "sample_pid":      sample_pid,
+                "process_events":  _merge("process"),
+                "file_events":     _merge("file"),
+                "registry_events": _merge("registry"),
+                "network_events":  _merge("network"),
                 "raw_path":        csv_path,
+                "db_path":         db_path,
             }
         except Exception as e:
             return {"available": False, "error": str(e)}

@@ -99,12 +99,27 @@ def generate_yara_rule(analysis: dict, rule_name: Optional[str] = None) -> Optio
 
 def save_yara_rule(analysis: dict, output_path: str) -> Optional[str]:
     """
-    Generate and save a YARA rule to a file.
-    Returns the file path on success, None if no rule could be generated.
+    Generate, FP-validate, and save a YARA rule to a file.
+    Injects fp_test result into rule metadata.
+    Returns the file path on success, None on failure.
     """
     rule = generate_yara_rule(analysis)
     if not rule:
         return None
+
+    fp = validate_yara_rule(rule)
+    if fp.get("syntax_error"):
+        return None
+
+    # Annotate metadata with FP test result
+    if fp.get("fp_hits", 0) > 0:
+        annotation = (f'        fp_test_benign_hits = '
+                      f'"{fp["fp_hits"]} hits on benign corpus — review before deployment"\n')
+        rule = rule.replace("    meta:\n", f"    meta:\n{annotation}", 1)
+    else:
+        annotation = '        fp_test_benign_hits = "0 — passed benign corpus check"\n'
+        rule = rule.replace("    meta:\n", f"    meta:\n{annotation}", 1)
+
     try:
         from pathlib import Path
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -112,6 +127,64 @@ def save_yara_rule(analysis: dict, output_path: str) -> Optional[str]:
         return output_path
     except Exception:
         return None
+
+
+# ── FP Validation ─────────────────────────────────────────────────────────────
+
+# Representative benign byte sequences from common Windows system files.
+# A well-crafted hunting rule should never match any of these.
+_BENIGN_CORPUS: list = [
+    b"This program cannot be run in DOS mode.",
+    b"Microsoft Corporation. All rights reserved.",
+    b"Windows NT",
+    b"kernel32.dll\x00user32.dll\x00advapi32.dll",
+    b"GetProcAddress\x00LoadLibraryA\x00ExitProcess",
+    b"CloseHandle\x00CreateFileA\x00ReadFile\x00WriteFile",
+    b"VirtualAlloc\x00HeapAlloc\x00HeapFree",
+    b"RegOpenKeyExA\x00RegQueryValueExA\x00RegCloseKey",
+    b"InternetOpenA\x00InternetConnectA\x00HttpOpenRequestA",
+    b"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+    b"C:\\Windows\\System32\\ntdll.dll",
+    b"C:\\Program Files\\Common Files",
+    b"PADDINGXXPADDING",
+    b".text\x00\x00\x00\x00",
+    b".data\x00\x00\x00\x00",
+    b".rsrc\x00\x00\x00\x00",
+    b"MZ\x90\x00\x03\x00\x00\x00\x04\x00",
+]
+
+
+def validate_yara_rule(rule_text: str) -> dict:
+    """
+    Compile the YARA rule and scan it against the benign corpus.
+
+    Returns:
+      {syntax_error: str|None, fp_hits: int, benign_matches: [str]}
+    """
+    try:
+        import yara
+    except ImportError:
+        return {"syntax_error": None, "fp_hits": 0, "benign_matches": [],
+                "note": "yara-python not installed; FP test skipped"}
+
+    try:
+        compiled = yara.compile(source=rule_text)
+    except yara.SyntaxError as e:
+        return {"syntax_error": str(e), "fp_hits": 0, "benign_matches": []}
+    except Exception as e:
+        return {"syntax_error": str(e), "fp_hits": 0, "benign_matches": []}
+
+    fp_hits    = 0
+    matched_on = []
+    for blob in _BENIGN_CORPUS:
+        try:
+            if compiled.match(data=blob):
+                fp_hits += 1
+                matched_on.append(blob[:40].decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    return {"syntax_error": None, "fp_hits": fp_hits, "benign_matches": matched_on[:5]}
 
 
 # ── Internal builders ─────────────────────────────────────────────────────────
