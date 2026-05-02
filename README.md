@@ -1,5 +1,14 @@
 # Malyze — AI-Powered Malware Analysis Framework
 
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat&logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078D4?style=flat&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=flat)
+![Ollama](https://img.shields.io/badge/LLM-Ollama-black?style=flat&logo=ollama&logoColor=white)
+![FlareVM](https://img.shields.io/badge/FlareVM-Compatible-red?style=flat)
+![MITRE ATT&CK](https://img.shields.io/badge/MITRE-ATT%26CK-E2231A?style=flat)
+![MCP](https://img.shields.io/badge/MCP-Server-6B46C1?style=flat&logo=anthropic&logoColor=white)
+![Version](https://img.shields.io/badge/Version-2.1-blue?style=flat)
+
 > An agentic, tool-by-tool malware analysis framework driven by a local LLM (Ollama).
 > Built for **FlareVM** sandbox environments. Fully offline — no cloud dependencies required.
 
